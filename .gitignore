@@ -1,0 +1,22 @@
+### Python
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+
+### Virtual environments
+.venv/
+
+### Generated data / artifacts (datagen)
+data/
+documents/
+_smoke_data/
+_smoke_documents/
+
+### OS / editor
+.DS_Store
+.vscode/
+
+### Secrets / local config
+.env
+.env.*
