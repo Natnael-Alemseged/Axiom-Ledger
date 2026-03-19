@@ -2,7 +2,7 @@
 Run ledger agents against an in-memory event store (no DB required).
 
 Phases:
-  document — seed corpus + DocumentProcessingAgent (Week 3 extraction + quality LLM).
+  document — seed corpus + DocumentProcessingAgent (refinery extraction + quality LLM).
   all      — document, then CreditAnalysisAgent (reads ExtractionCompleted from docpkg stream).
 
 Usage:
