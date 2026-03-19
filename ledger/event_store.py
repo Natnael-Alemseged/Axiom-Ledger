@@ -11,9 +11,8 @@ COMPLETION CHECKLIST (implement in order):
 from __future__ import annotations
 import json
 from datetime import datetime
-from typing import AsyncGenerator
+from typing import Any, AsyncGenerator
 from uuid import UUID
-import asyncpg
 
 
 class OptimisticConcurrencyError(Exception):
@@ -38,9 +37,18 @@ class EventStore:
     def __init__(self, db_url: str, upcaster_registry=None):
         self.db_url = db_url
         self.upcasters = upcaster_registry
-        self._pool: asyncpg.Pool | None = None
+        self._pool: Any = None
 
     async def connect(self) -> None:
+        try:
+            import asyncpg
+        except ImportError as e:
+            raise ImportError(
+                "asyncpg is required for PostgreSQL EventStore.connect(). "
+                "Install: pip install 'asyncpg>=0.29.0,<0.30' (Python 3.11–3.13). "
+                "Python 3.14: use InMemoryEventStore for local runs or a 3.13 venv until asyncpg "
+                "publishes a compatible release."
+            ) from e
         self._pool = await asyncpg.create_pool(self.db_url, min_size=2, max_size=10)
 
     async def close(self) -> None:

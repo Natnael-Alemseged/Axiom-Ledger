@@ -9,7 +9,7 @@ The Applicant Registry is the external CRM — seeded by datagen/generate_all.py
 """
 from __future__ import annotations
 from dataclasses import dataclass
-import asyncpg
+from typing import Any
 
 @dataclass
 class CompanyProfile:
@@ -41,7 +41,8 @@ class ApplicantRegistryClient:
     Never write to this database from the event store system.
     """
 
-    def __init__(self, pool: asyncpg.Pool):
+    def __init__(self, pool: Any):
+        """pool: asyncpg.Pool when using PostgreSQL."""
         self._pool = pool
 
     async def get_company(self, company_id: str) -> CompanyProfile | None:

@@ -1,0 +1,7 @@
+# PostgreSQL driver — same rule as requirements.txt: skipped on Python 3.14+ (asyncpg has no wheel).
+# Safe to run on any Python version; pip only installs asyncpg when python_version < "3.14".
+#
+#   pip install -r requirements.txt -r requirements-database.txt
+#
+# On 3.14 you get all other deps + no asyncpg (use InMemoryEventStore, or a 3.11–3.13 venv for Postgres).
+asyncpg>=0.29.0,<0.30; python_version < "3.14"
