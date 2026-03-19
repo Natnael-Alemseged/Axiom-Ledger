@@ -1,6 +1,10 @@
 # Core
-asyncpg>=0.29.0,<0.30
+# asyncpg: C extension; 0.29 does not build on Python 3.14+. Omitted on 3.14+ so the rest of the
+# stack resolves (pipeline + InMemoryEventStore work without it). For PostgreSQL EventStore on
+# 3.14, watch for newer asyncpg wheels or use Python 3.11–3.13 and: pip install "asyncpg>=0.29.0,<0.30"
+asyncpg>=0.29.0,<0.30; python_version < "3.14"
 anthropic>=0.30.0,<0.40
+google-generativeai>=0.8.0,<1.0
 pydantic>=2.6.0,<3.0
 langgraph>=0.1.0,<0.3
 
@@ -8,6 +12,10 @@ langgraph>=0.1.0,<0.3
 faker>=24.0.0,<26.0
 reportlab>=4.2.0,<5.0
 openpyxl>=3.1.0,<4.0
+
+# Document pipeline (PDF validation; Week 3 fast-text works with pdfplumber alone)
+pdfplumber>=0.10,<1.0
+# Full Week 3 layout (Docling): also install requirements-week3.txt (see README).
 
 # MCP server (Phase 5)
 fastmcp>=0.9.0
@@ -17,6 +25,3 @@ python-dotenv>=1.0.0,<2.0
 pytest>=8.0.0,<9.0
 pytest-asyncio>=0.23.0,<0.25
 
-# Your Week 3 pipeline (uncomment the one you used):
-# mineru>=1.0
-# docling>=2.0
