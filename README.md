@@ -1,4 +1,6 @@
-# The Ledger — Weeks 9-10 Starter Code
+# Axiom Ledger
+
+Event-sourced lending pipeline: document intake, extraction, credit analysis, and downstream agents with an append-only event ledger.
 
 ## Quick Start
 ```bash
@@ -7,8 +9,8 @@
 
 # 1. Install dependencies (use the SAME interpreter for pip and python — see troubleshooting below)
 python -m pip install -r requirements.txt -r requirements-database.txt
-# Optional: Week 3 Docling layout extraction (large; includes PyTorch)
-# python -m pip install -r requirements-week3.txt
+# Optional: Docling layout extraction (large; includes PyTorch) — see Document Intelligence Refinery below
+# python -m pip install -r requirements-refinery.txt
 # Or core only: python -m pip install -r requirements.txt
 
 # 2. Start PostgreSQL
@@ -24,12 +26,11 @@ python datagen/generate_all.py --db-url postgresql://postgres:apex@localhost/ape
 # 5. Validate schema (no DB needed)
 python datagen/generate_all.py --skip-db --skip-docs --validate-only
 
-# 6. Run Phase 0 tests (must pass before starting Phase 1)
+# 6. Schema & generator tests
 pytest tests/test_schema_and_generator.py -v
 
-# 7. Begin Phase 1: implement EventStore
-# Edit: ledger/event_store.py
-# Test: pytest tests/test_event_store.py -v
+# 7. Event store (implement in ledger/event_store.py), then:
+# pytest tests/test_event_store.py -v
 ```
 
 **Troubleshooting (imports missing after `pip install`):** use `python -m pip install -r requirements.txt` so packages install into the **same** interpreter you run. If `.venv/bin/pip` and `.venv/bin/python` target different Python versions (broken venv), recreate the venv or relink `python`/`python3` to match `pip` (e.g. both `python3.14`).
@@ -37,23 +38,23 @@ pytest tests/test_schema_and_generator.py -v
 ## What Works Out of the Box
 - Full event schema (45 event types) — `ledger/schema/events.py`
 - Complete data generator (GAAP PDFs, Excel, CSV, 1,200+ seed events)
-- Event simulator (all 5 agent pipelines, deterministic)
+- Event simulator (all five agent pipelines, deterministic)
 - Schema validator (validates all events against EVENT_REGISTRY)
-- Phase 0 tests: 10/10 passing
+- Starter tests (`test_schema_and_generator.py`): 10/10 passing
 
-## Week 3 Integration (Document Intelligence Refinery)
+## Document Intelligence Refinery
 
 `DocumentProcessingAgent` in `ledger/agents/stub_agents.py` is wired to a local adapter:
 - `ledger/integrations/document_refinery_adapter.py`
-- Vendor clone path: `vendor/Document-Intelligence-Refinery`
+- Vendor sources: `vendor/Document-Intelligence-Refinery`
 
 The adapter:
-- Imports Week 3 triage/extraction from the vendor repo (`run_triage` + `run_extraction`)
+- Imports refinery triage/extraction from the vendor package (`run_triage` + `run_extraction`)
 - Normalizes extraction output to ledger `FinancialFacts`
 - Enforces critical field handling (`field_confidence[field] = 0.0` and `extraction_notes`)
 - Loads top-level `.env` automatically. **OpenRouter** keys (`sk-or-v1-...`) go in `OPENROUTER_API_KEY`; **Google** keys (often `AIza...`) use `GEMINI_API_KEY` / `GOOGLE_API_KEY`. Mis-labeled OpenRouter keys are not sent to Google’s API.
 - Prefers the Gemini provider path when a **valid Google** key is present
-- Falls back to FastText extraction when optional Week 3 layout/vision deps are unavailable
+- Falls back to fast-text extraction when optional layout/vision dependencies are not installed
 
 ### Setup for local integration runs
 
@@ -61,13 +62,13 @@ The adapter:
 # 1) Core ledger + PDF validation
 .venv/bin/python -m pip install -r requirements.txt
 
-# 2) Full Week 3 stack (Docling layout, not only fast-text fallback)
+# 2) Full refinery stack (Docling layout, not only fast-text fallback)
 #    Installs torch, docling, chromadb, sentence-transformers, etc. — first run can download models.
-.venv/bin/python -m pip install -r requirements-week3.txt
+.venv/bin/python -m pip install -r requirements-refinery.txt
 # Equivalent: .venv/bin/python -m pip install -e "vendor/Document-Intelligence-Refinery"
 ```
 
-After `requirements-week3.txt`, extraction should use **`strategy=layout`** (see pipeline logs) instead of `fast_text_fallback` when Docling is available.
+After installing the refinery extras (`requirements-refinery.txt`), extraction should use **`strategy=layout`** (see pipeline logs) instead of `fast_text_fallback` when Docling is available.
 
 ### Quick smoke test: adapter only
 
@@ -186,27 +187,29 @@ Expected event sequence:
   - `PackageReadyForAnalysis` exists
   - `CreditAnalysisRequested` was appended to the loan stream
 
-## What You Implement
-| Component | File | Phase |
-|-----------|------|-------|
-| EventStore | `ledger/event_store.py` | 1 |
-| ApplicantRegistryClient | `ledger/registry/client.py` | 1 |
-| Domain aggregates | `ledger/domain/aggregates/` | 2 |
-| DocumentProcessingAgent | `ledger/agents/base_agent.py` | 2 |
-| CreditAnalysisAgent | `ledger/agents/base_agent.py` | 2 (reference given) |
-| FraudDetectionAgent | `ledger/agents/base_agent.py` | 3 |
-| ComplianceAgent | `ledger/agents/base_agent.py` | 3 |
-| DecisionOrchestratorAgent | `ledger/agents/base_agent.py` | 3 |
-| Projections + daemon | `ledger/projections/` | 4 |
-| Upcasters | `ledger/upcasters.py` | 4 |
-| MCP server | `ledger/mcp_server.py` | 5 |
+## Implementation roadmap
 
-## Gate Tests by Phase
+| Component | File | Track |
+|-----------|------|--------|
+| EventStore | `ledger/event_store.py` | Core persistence |
+| ApplicantRegistryClient | `ledger/registry/client.py` | Registry |
+| Domain aggregates | `ledger/domain/aggregates/` | Domain model |
+| DocumentProcessingAgent | `ledger/agents/base_agent.py` | Documents |
+| CreditAnalysisAgent | `ledger/agents/base_agent.py` | Credit (reference) |
+| FraudDetectionAgent | `ledger/agents/base_agent.py` | Fraud |
+| ComplianceAgent | `ledger/agents/base_agent.py` | Compliance |
+| DecisionOrchestratorAgent | `ledger/agents/base_agent.py` | Orchestration |
+| Projections + daemon | `ledger/projections/` | Read models |
+| Upcasters | `ledger/upcasters.py` | Schema migration |
+| MCP server | `ledger/mcp_server.py` | Tooling |
+
+## Tests (suggested order)
+
 ```bash
-pytest tests/test_schema_and_generator.py -v  # Phase 0: all must pass before Phase 1
-pytest tests/test_event_store.py -v           # Phase 1
-pytest tests/test_domain.py -v               # Phase 2
-pytest tests/test_narratives.py -v           # Phase 3: all 5 must pass
-pytest tests/test_projections.py -v          # Phase 4
-pytest tests/test_mcp.py -v                  # Phase 5
+pytest tests/test_schema_and_generator.py -v
+pytest tests/test_event_store.py -v
+pytest tests/test_domain.py -v
+pytest tests/test_narratives.py -v
+pytest tests/test_projections.py -v
+pytest tests/test_mcp.py -v
 ```

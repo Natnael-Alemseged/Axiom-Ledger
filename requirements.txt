@@ -13,9 +13,9 @@ faker>=24.0.0,<26.0
 reportlab>=4.2.0,<5.0
 openpyxl>=3.1.0,<4.0
 
-# Document pipeline (PDF validation; Week 3 fast-text works with pdfplumber alone)
+# Document pipeline (PDF validation; refinery fast-text works with pdfplumber alone)
 pdfplumber>=0.10,<1.0
-# Full Week 3 layout (Docling): also install requirements-week3.txt (see README).
+# Docling layout stack: also install requirements-refinery.txt (see README).
 
 # MCP server (Phase 5)
 fastmcp>=0.9.0

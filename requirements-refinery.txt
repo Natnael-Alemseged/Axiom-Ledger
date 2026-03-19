@@ -1,7 +1,7 @@
-# Week 3 — Document Intelligence Refinery (vendor) + Docling layout pipeline.
+# Document Intelligence Refinery (vendor) + Docling layout pipeline.
 # Large install (PyTorch, docling, chromadb, sentence-transformers, …). Optional for local dev
 # without layout; required for `strategy=layout` extraction instead of fast_text_fallback.
 #
-#   python -m pip install -r requirements.txt -r requirements-week3.txt
+#   python -m pip install -r requirements.txt -r requirements-refinery.txt
 #
 -e "vendor/Document-Intelligence-Refinery"
