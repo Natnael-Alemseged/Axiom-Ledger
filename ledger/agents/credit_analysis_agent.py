@@ -34,15 +34,19 @@ WHEN THIS WORKS:
     → FraudScreeningRequested event on loan stream
 """
 from __future__ import annotations
-import time, json
+import json
+import logging
+import time
 from datetime import datetime
 from decimal import Decimal
-from typing import TypedDict, Annotated
+from typing import Annotated, NotRequired, TypedDict
 from uuid import uuid4
 
 from langgraph.graph import StateGraph, END
 
 from ledger.agents.base_agent import BaseApexAgent
+
+_LOG = logging.getLogger(__name__)
 from ledger.schema.events import (
     CreditRecordOpened, HistoricalProfileConsumed, ExtractedFactsConsumed,
     CreditAnalysisCompleted, CreditAnalysisDeferred,
@@ -76,11 +80,25 @@ class CreditState(TypedDict):
     errors: list[str]
     output_events: list[dict]
     next_agent: str | None
+    next_agent_triggered: NotRequired[str | None]
 
 
 # ─── AGENT ────────────────────────────────────────────────────────────────────
 
 class CreditAnalysisAgent(BaseApexAgent):
+    def __init__(
+        self,
+        agent_id: str,
+        agent_type: str,
+        store,
+        registry,
+        client,
+        model: str = "claude-sonnet-4-20250514",
+        *,
+        applicant_id_override: str | None = None,
+    ):
+        super().__init__(agent_id, agent_type, store, registry, client, model)
+        self._applicant_id_override = applicant_id_override
 
     def build_graph(self) -> Any:
         from typing import Any
@@ -114,23 +132,45 @@ class CreditAnalysisAgent(BaseApexAgent):
             errors=[], output_events=[], next_agent=None,
         )
 
+    @staticmethod
+    def _parse_json(text: str) -> dict:
+        raw = (text or "").strip()
+        try:
+            parsed = json.loads(raw)
+            return parsed if isinstance(parsed, dict) else {}
+        except Exception:
+            pass
+        start = raw.find("{")
+        end = raw.rfind("}")
+        if start >= 0 and end > start:
+            try:
+                parsed = json.loads(raw[start : end + 1])
+                return parsed if isinstance(parsed, dict) else {}
+            except Exception:
+                return {}
+        return {}
+
     # ── NODE 1: VALIDATE INPUTS ───────────────────────────────────────────────
     async def _node_validate_inputs(self, state: CreditState) -> CreditState:
         t = time.time()
         app_id = state["application_id"]
         errors = []
 
+        loan_events = await self.store.load_stream(f"loan-{app_id}")
+        if not any(e.get("event_type") == "CreditAnalysisRequested" for e in loan_events):
+            errors.append(
+                "CreditAnalysisRequested missing on loan stream — run DocumentProcessingAgent first "
+                "(e.g. scripts/run_pipeline.py --phase all)."
+            )
+
         # Load LoanApplicationAggregate to get applicant_id and amounts
         # TODO: implement LoanApplicationAggregate.load()
-        # app = await LoanApplicationAggregate.load(self.store, app_id)
-        # if app.state not in (ApplicationState.DOCUMENTS_PROCESSED, ApplicationState.CREDIT_ANALYSIS_REQUESTED):
-        #     errors.append(f"Expected DOCUMENTS_PROCESSED, got {app.state}")
-        # state["applicant_id"]         = app.applicant_id
-        # state["requested_amount_usd"] = float(app.requested_amount_usd)
-        # state["loan_purpose"]         = app.loan_purpose.value
 
         # PLACEHOLDER — remove when LoanApplicationAggregate is implemented
-        state["applicant_id"]         = f"COMP-001"
+        if self._applicant_id_override:
+            state["applicant_id"] = self._applicant_id_override
+        else:
+            state["applicant_id"] = f"COMP-001"
         state["requested_amount_usd"] = 500_000.0
         state["loan_purpose"]         = "working_capital"
 
@@ -377,12 +417,18 @@ PRIOR LOAN HISTORY:
 Provide your analysis as JSON."""
 
         decision: dict
-        ti = to = 0
-        cost = 0.0
+        ti: int | None = None
+        to: int | None = None
+        cost: float | None = None
         try:
             content, ti, to, cost = await self._call_llm(SYSTEM, USER, max_tokens=1024)
             decision = self._parse_json(content)
         except Exception as exc:
+            _LOG.exception(
+                "credit_analyze_llm_failed application_id=%s model=%s",
+                state.get("application_id"),
+                self.model,
+            )
             # Safe fallback — confidence < 0.60 forces REFER downstream
             decision = {
                 "risk_tier": "MEDIUM",
@@ -467,7 +513,7 @@ Provide your analysis as JSON."""
             model_version=self.model,
             model_deployment_id=f"dep-{uuid4().hex[:8]}",
             input_data_hash=self._sha(state),
-            analysis_duration_ms=int((time.time() - self._t0) * 1000),
+            analysis_duration_ms=int((time.perf_counter() - self._t0) * 1000),
             completed_at=datetime.now(),
         ).to_store_dict()
 
@@ -501,4 +547,9 @@ Provide your analysis as JSON."""
         await self._record_node_execution(
             "write_output", ["credit_decision"], ["events_written"], ms
         )
-        return {**state, "output_events": events_written, "next_agent": "fraud_detection"}
+        return {
+            **state,
+            "output_events": events_written,
+            "next_agent": "fraud_detection",
+            "next_agent_triggered": "fraud_detection",
+        }

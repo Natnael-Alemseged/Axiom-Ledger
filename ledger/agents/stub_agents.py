@@ -15,15 +15,31 @@ Pattern: follow CreditAnalysisAgent exactly. Same build_graph() structure,
 same _record_node_execution() calls, same _append_with_retry() for domain writes.
 """
 from __future__ import annotations
+import logging
 import time, json
 from datetime import datetime
 from decimal import Decimal
-from typing import TypedDict
+from typing import Any, NotRequired, TypedDict
 from uuid import uuid4
 
 from langgraph.graph import StateGraph, END
 
 from ledger.agents.base_agent import BaseApexAgent
+from ledger.integrations.document_refinery_adapter import extract_financial_facts
+from ledger.schema.events import (
+    CreditAnalysisRequested,
+    DocumentFormatRejected,
+    DocumentFormatValidated,
+    DocumentType,
+    ExtractionCompleted,
+    ExtractionFailed,
+    ExtractionStarted,
+    FinancialFacts,
+    PackageReadyForAnalysis,
+    QualityAssessmentCompleted,
+)
+
+_LOG_DOC = logging.getLogger(__name__)
 
 
 # ─── DOCUMENT PROCESSING AGENT ───────────────────────────────────────────────
@@ -31,13 +47,17 @@ from ledger.agents.base_agent import BaseApexAgent
 class DocProcState(TypedDict):
     application_id: str
     session_id: str
+    package_id: str | None
     document_ids: list[str] | None
     document_paths: list[str] | None
+    documents_by_type: dict[str, dict[str, Any]] | None
     extraction_results: list[dict] | None  # one per document
     quality_assessment: dict | None
+    quality_flags: list[str] | None
     errors: list[str]
     output_events: list[dict]
     next_agent: str | None
+    next_agent_triggered: NotRequired[str | None]
 
 
 class DocumentProcessingAgent(BaseApexAgent):
@@ -76,6 +96,22 @@ class DocumentProcessingAgent(BaseApexAgent):
           → CreditAnalysisRequested on loan stream
     """
 
+    QUALITY_SYSTEM_PROMPT = """
+You are a financial document quality analyst. You receive structured data
+extracted from a company's financial statements.
+
+Check ONLY:
+1. Internal consistency (Gross Profit = Revenue - COGS, Assets = Liabilities + Equity)
+2. Implausible values (margins > 80%, negative equity without note)
+3. Critical missing fields (total_revenue, net_income, total_assets, total_liabilities)
+
+Return JSON: {"overall_confidence": float, "is_coherent": bool,
+  "anomalies": [str], "critical_missing_fields": [str],
+  "reextraction_recommended": bool, "auditor_notes": str}
+
+DO NOT make credit or lending decisions. DO NOT suggest loan outcomes.
+"""
+
     def build_graph(self):
         g = StateGraph(DocProcState)
         g.add_node("validate_inputs",            self._node_validate_inputs)
@@ -97,77 +133,422 @@ class DocumentProcessingAgent(BaseApexAgent):
     def _initial_state(self, application_id: str) -> DocProcState:
         return DocProcState(
             application_id=application_id, session_id=self.session_id,
+            package_id=None,
             document_ids=None, document_paths=None,
+            documents_by_type=None,
             extraction_results=None, quality_assessment=None,
+            quality_flags=None,
             errors=[], output_events=[], next_agent=None,
         )
 
-    async def _node_validate_inputs(self, state):
-        t = time.time()
-        # TODO:
-        # 1. Load DocumentUploaded events from "loan-{app_id}" stream
-        # 2. Extract document_ids and file_paths for each uploaded document
-        # 3. Verify at least APPLICATION_PROPOSAL + INCOME_STATEMENT + BALANCE_SHEET uploaded
-        # 4. If any required doc missing: await self._record_input_failed([...], [...]) then raise
-        # 5. await self._record_input_validated(["application_id","document_ids","file_paths"], ms)
-        raise NotImplementedError("Implement _node_validate_inputs")
+    @staticmethod
+    def _safe_json_extract(text: str) -> dict[str, Any]:
+        raw = (text or "").strip()
+        try:
+            parsed = json.loads(raw)
+            return parsed if isinstance(parsed, dict) else {}
+        except Exception:
+            pass
+        start = raw.find("{")
+        end = raw.rfind("}")
+        if start >= 0 and end > start:
+            try:
+                parsed = json.loads(raw[start : end + 1])
+                return parsed if isinstance(parsed, dict) else {}
+            except Exception:
+                return {}
+        return {}
 
-    async def _node_validate_formats(self, state):
-        t = time.time()
-        # TODO:
-        # For each document:
-        #   1. Check file exists on disk, is not corrupt
-        #   2. Detect actual format (PyPDF2, python-magic, etc.)
-        #   3. Append DocumentFormatValidated(package_id, doc_id, page_count, detected_format)
-        #      to "docpkg-{app_id}" stream
-        #   4. If corrupt: append DocumentFormatRejected and remove from processing list
-        # 5. await self._record_node_execution("validate_document_formats", ...)
-        raise NotImplementedError("Implement _node_validate_formats")
+    @staticmethod
+    def _merge_extracted_facts(extraction_results: list[dict]) -> dict[str, Any]:
+        merged: dict[str, Any] = {}
+        merged_confidence: dict[str, float] = {}
+        merged_notes: list[str] = []
+        for result in extraction_results:
+            facts = result.get("facts") or {}
+            for k, v in facts.items():
+                if k in {"field_confidence", "extraction_notes"}:
+                    continue
+                if v is not None and merged.get(k) is None:
+                    merged[k] = v
+            for field, confidence in (facts.get("field_confidence") or {}).items():
+                if field not in merged_confidence:
+                    merged_confidence[field] = confidence
+                else:
+                    merged_confidence[field] = min(merged_confidence[field], confidence)
+            merged_notes.extend(facts.get("extraction_notes") or [])
+        merged["field_confidence"] = merged_confidence
+        merged["extraction_notes"] = merged_notes
+        return merged
 
-    async def _node_extract_is(self, state):
+    async def _node_validate_inputs(self, state: DocProcState) -> DocProcState:
         t = time.time()
-        # TODO:
-        # 1. Find income statement document from state["document_paths"]
-        # 2. Append ExtractionStarted(package_id, doc_id, pipeline_version, "mineru-1.0")
-        #    to "docpkg-{app_id}" stream
-        # 3. Call Week 3 pipeline:
-        #    from document_refinery.pipeline import extract_financial_facts
-        #    facts = await extract_financial_facts(file_path, "income_statement")
-        # 4. On success: append ExtractionCompleted(facts=FinancialFacts(**facts), ...)
-        # 5. On failure: append ExtractionFailed(error_type, error_message, partial_facts)
-        # 6. await self._record_tool_call("week3_extraction_pipeline", ..., ms)
-        # 7. await self._record_node_execution("extract_income_statement", ...)
-        raise NotImplementedError("Implement _node_extract_is")
+        app_id = state["application_id"]
+        _LOG_DOC.info("docproc_validate_inputs_start application_id=%s", app_id)
+        loan_events = await self.store.load_stream(f"loan-{app_id}")
+        pkg_events = await self.store.load_stream(f"docpkg-{app_id}")
+        package_created = next((e for e in reversed(pkg_events) if e["event_type"] == "PackageCreated"), None)
+        package_id = ((package_created or {}).get("payload") or {}).get("package_id", app_id)
 
-    async def _node_extract_bs(self, state):
-        t = time.time()
-        # TODO: Same pattern as _node_extract_is but for balance sheet
-        # Key difference: ExtractionCompleted for balance sheet should populate
-        # total_assets, total_liabilities, total_equity, current_assets, etc.
-        # The QualityAssessmentCompleted LLM will check Assets = Liabilities + Equity
-        raise NotImplementedError("Implement _node_extract_bs")
+        uploaded = [e for e in loan_events if e["event_type"] == "DocumentUploaded"]
+        required = {"application_proposal", "income_statement", "balance_sheet"}
+        selected: dict[str, dict[str, Any]] = {}
+        for ev in reversed(uploaded):
+            payload = ev.get("payload", {})
+            dtype = payload.get("document_type")
+            if dtype in required and dtype not in selected:
+                selected[dtype] = payload
+                if len(selected) == len(required):
+                    break
 
-    async def _node_assess_quality(self, state):
-        t = time.time()
-        # TODO:
-        # 1. Merge extraction results from IS + BS into a combined FinancialFacts
-        # 2. Build LLM prompt asking for quality assessment (consistency check)
-        # 3. content, ti, to, cost = await self._call_llm(SYSTEM, USER, 512)
-        # 4. Parse DocumentQualityAssessment from JSON response
-        # 5. Append QualityAssessmentCompleted to "docpkg-{app_id}" stream
-        # 6. If critical_missing_fields: add to state["quality_flags"]
-        # 7. await self._record_node_execution("assess_quality", ..., ms, ti, to, cost)
-        raise NotImplementedError("Implement _node_assess_quality")
+        missing = sorted(required - set(selected.keys()))
+        if missing:
+            errors = [f"Missing required uploaded documents: {', '.join(missing)}"]
+            _LOG_DOC.warning("docproc_validate_inputs_missing application_id=%s missing=%s", app_id, missing)
+            await self._record_input_failed(missing, errors)
+            raise ValueError("; ".join(errors))
 
-    async def _node_write_output(self, state):
+        ms = int((time.time() - t) * 1000)
+        _LOG_DOC.info(
+            "docproc_validate_inputs_ok application_id=%s package_id=%s doc_types=%s duration_ms=%s",
+            app_id,
+            package_id,
+            sorted(selected.keys()),
+            ms,
+        )
+        await self._record_input_validated(["application_id", "document_ids", "file_paths", "package_id"], ms)
+        await self._record_node_execution(
+            "validate_inputs",
+            ["application_id"],
+            ["document_ids", "document_paths", "documents_by_type", "package_id"],
+            ms,
+        )
+        return {
+            **state,
+            "package_id": package_id,
+            "document_ids": [selected[k]["document_id"] for k in sorted(selected.keys())],
+            "document_paths": [selected[k]["file_path"] for k in sorted(selected.keys())],
+            "documents_by_type": selected,
+        }
+
+    async def _node_validate_formats(self, state: DocProcState) -> DocProcState:
         t = time.time()
-        # TODO:
-        # 1. Append PackageReadyForAnalysis to "docpkg-{app_id}" stream
-        # 2. Append CreditAnalysisRequested to "loan-{app_id}" stream
-        # 3. await self._record_output_written([...], summary)
-        # 4. await self._record_node_execution("write_output", ...)
-        # 5. return {**state, "next_agent": "credit_analysis"}
-        raise NotImplementedError("Implement _node_write_output")
+        app_id = state["application_id"]
+        _LOG_DOC.info("docproc_validate_formats_start application_id=%s", app_id)
+        package_id = state.get("package_id") or app_id
+        docs = state.get("documents_by_type") or {}
+        errors = list(state.get("errors") or [])
+        valid_docs: dict[str, dict[str, Any]] = {}
+
+        import pathlib
+        import pdfplumber
+
+        for dtype, payload in docs.items():
+            doc_id = payload["document_id"]
+            path = pathlib.Path(payload["file_path"])
+            _LOG_DOC.debug("docproc_validate_pdf doc_id=%s type=%s path=%s", doc_id, dtype, path)
+            try:
+                if not path.exists():
+                    raise FileNotFoundError(str(path))
+                if path.suffix.lower() != ".pdf":
+                    raise ValueError(f"Unsupported format for Week 3 extraction: {path.suffix}")
+                with pdfplumber.open(path) as pdf:
+                    page_count = len(pdf.pages)
+                ev = DocumentFormatValidated(
+                    package_id=package_id,
+                    document_id=doc_id,
+                    document_type=DocumentType(dtype),
+                    page_count=page_count,
+                    detected_format="pdf",
+                    validated_at=datetime.now(),
+                ).to_store_dict()
+                await self._append_stream(f"docpkg-{app_id}", ev)
+                valid_docs[dtype] = payload
+            except Exception as exc:
+                errors.append(f"{doc_id}: {exc}")
+                rej = DocumentFormatRejected(
+                    package_id=package_id,
+                    document_id=doc_id,
+                    rejection_reason=str(exc)[:500],
+                    rejected_at=datetime.now(),
+                ).to_store_dict()
+                await self._append_stream(f"docpkg-{app_id}", rej)
+
+        if "income_statement" not in valid_docs or "balance_sheet" not in valid_docs:
+            _LOG_DOC.error("docproc_validate_formats_failed application_id=%s errors=%s", app_id, errors)
+            raise ValueError("Required PDFs for income_statement and balance_sheet are not valid.")
+
+        ms = int((time.time() - t) * 1000)
+        _LOG_DOC.info("docproc_validate_formats_ok application_id=%s valid_types=%s duration_ms=%s", app_id, list(valid_docs.keys()), ms)
+        await self._record_node_execution(
+            "validate_document_formats",
+            ["documents_by_type"],
+            ["documents_by_type"],
+            ms,
+        )
+        return {**state, "documents_by_type": valid_docs, "errors": errors}
+
+    async def _extract_document(self, state: DocProcState, document_type: str, node_name: str) -> DocProcState:
+        t = time.time()
+        app_id = state["application_id"]
+        _LOG_DOC.info("docproc_extract_start application_id=%s node=%s document_type=%s", app_id, node_name, document_type)
+        package_id = state.get("package_id") or app_id
+        docs = state.get("documents_by_type") or {}
+        doc = docs.get(document_type)
+        if not doc:
+            raise ValueError(f"Missing document payload for {document_type}")
+
+        doc_id = doc["document_id"]
+        file_path = doc["file_path"]
+        started = ExtractionStarted(
+            package_id=package_id,
+            document_id=doc_id,
+            document_type=DocumentType(document_type),
+            pipeline_version="week3-refinery",
+            extraction_model="refinery.run_extraction",
+            started_at=datetime.now(),
+        ).to_store_dict()
+        await self._append_stream(f"docpkg-{app_id}", started, causation_id=self.session_id)
+
+        extraction_results = list(state.get("extraction_results") or [])
+        errors = list(state.get("errors") or [])
+        try:
+            adapter_result = await extract_financial_facts(file_path, document_type)
+            facts_dict = adapter_result["facts"]
+            completed = ExtractionCompleted(
+                package_id=package_id,
+                document_id=doc_id,
+                document_type=DocumentType(document_type),
+                facts=FinancialFacts(**facts_dict),
+                raw_text_length=max(0, int(adapter_result["raw_text_length"])),
+                tables_extracted=max(0, int(adapter_result["tables_extracted"])),
+                processing_ms=max(1, int(adapter_result["processing_ms"])),
+                completed_at=datetime.now(),
+            ).to_store_dict()
+            await self._append_stream(f"docpkg-{app_id}", completed, causation_id=self.session_id)
+            extraction_results.append(
+                {"document_id": doc_id, "document_type": document_type, "facts": facts_dict}
+            )
+            await self._record_tool_call(
+                "week3_extraction_pipeline",
+                f"path={file_path},type={document_type}",
+                f"status={adapter_result['status']} strategy={adapter_result['strategy_used']}",
+                int((time.time() - t) * 1000),
+            )
+            _LOG_DOC.info(
+                "docproc_extract_ok application_id=%s doc_id=%s type=%s strategy=%s status=%s processing_ms=%s",
+                app_id,
+                doc_id,
+                document_type,
+                adapter_result["strategy_used"],
+                adapter_result["status"],
+                adapter_result["processing_ms"],
+            )
+        except Exception as exc:
+            _LOG_DOC.exception(
+                "docproc_extract_failed application_id=%s doc_id=%s type=%s path=%s",
+                app_id,
+                doc_id,
+                document_type,
+                file_path,
+            )
+            errors.append(f"{document_type} extraction failed: {exc}")
+            failed = ExtractionFailed(
+                package_id=package_id,
+                document_id=doc_id,
+                error_type=type(exc).__name__,
+                error_message=str(exc)[:500],
+                partial_facts=None,
+                failed_at=datetime.now(),
+            ).to_store_dict()
+            await self._append_stream(f"docpkg-{app_id}", failed, causation_id=self.session_id)
+            await self._record_tool_call(
+                "week3_extraction_pipeline",
+                f"path={file_path},type={document_type}",
+                f"failed={type(exc).__name__}",
+                int((time.time() - t) * 1000),
+            )
+
+        ms = int((time.time() - t) * 1000)
+        await self._record_node_execution(
+            node_name,
+            ["documents_by_type"],
+            ["extraction_results"],
+            ms,
+        )
+        return {**state, "extraction_results": extraction_results, "errors": errors}
+
+    async def _node_extract_is(self, state: DocProcState) -> DocProcState:
+        return await self._extract_document(state, "income_statement", "extract_income_statement")
+
+    async def _node_extract_bs(self, state: DocProcState) -> DocProcState:
+        return await self._extract_document(state, "balance_sheet", "extract_balance_sheet")
+
+    async def _node_assess_quality(self, state: DocProcState) -> DocProcState:
+        t = time.time()
+        app_id = state["application_id"]
+        _LOG_DOC.info("docproc_assess_quality_start application_id=%s extraction_docs=%s", app_id, len(state.get("extraction_results") or []))
+        package_id = state.get("package_id") or app_id
+        extraction_results = list(state.get("extraction_results") or [])
+        merged_facts = self._merge_extracted_facts(extraction_results)
+        critical = ["total_revenue", "net_income", "total_assets", "total_liabilities"]
+        critical_missing = [k for k in critical if merged_facts.get(k) is None]
+
+        ti: int | None = None
+        to: int | None = None
+        cost: float | None = None
+        fallback_notes = []
+        content = ""
+        try:
+            user_prompt = (
+                "Assess the following extracted financial facts for coherence.\n"
+                f"Facts JSON:\n{json.dumps(merged_facts, default=str, indent=2)}"
+            )
+            content, ti, to, cost = await self._call_llm(
+                self.QUALITY_SYSTEM_PROMPT,
+                user_prompt,
+                max_tokens=512,
+            )
+            qa = self._safe_json_extract(content)
+        except Exception as exc:
+            qa = {}
+            fallback_notes.append(f"LLM quality assessment fallback used: {type(exc).__name__}: {exc!s:.200}")
+            ti = to = cost = None
+
+        if fallback_notes:
+            _LOG_DOC.warning(
+                "docproc_assess_quality_llm_fallback application_id=%s — %s "
+                "(confidence/metrics below may be defaults, not model output)",
+                app_id,
+                "; ".join(fallback_notes),
+            )
+        else:
+            _LOG_DOC.info(
+                "docproc_assess_quality_llm_ok application_id=%s prompt_tokens=%s output_tokens=%s",
+                app_id,
+                ti,
+                to,
+            )
+
+        anomalies: list[str] = list(qa.get("anomalies") or [])
+        revenue = merged_facts.get("total_revenue")
+        gross_profit = merged_facts.get("gross_profit")
+        if isinstance(revenue, Decimal) and isinstance(gross_profit, Decimal):
+            if revenue != 0 and float(gross_profit / revenue) > 0.80:
+                anomalies.append("Gross margin exceeds 80% and may be implausible.")
+        assets = merged_facts.get("total_assets")
+        liabilities = merged_facts.get("total_liabilities")
+        equity = merged_facts.get("total_equity")
+        if isinstance(assets, Decimal) and isinstance(liabilities, Decimal) and isinstance(equity, Decimal):
+            delta = assets - liabilities - equity
+            if abs(delta) > Decimal("1.00"):
+                anomalies.append("Balance sheet inconsistency: assets != liabilities + equity.")
+        if isinstance(equity, Decimal) and equity < 0:
+            anomalies.append("Negative equity detected without explicit note.")
+
+        qa_result = {
+            "overall_confidence": float(qa.get("overall_confidence", 0.55 if critical_missing else 0.78)),
+            "is_coherent": bool(qa.get("is_coherent", len(anomalies) == 0 and not critical_missing)),
+            "anomalies": anomalies,
+            "critical_missing_fields": list(qa.get("critical_missing_fields") or critical_missing),
+            "reextraction_recommended": bool(
+                qa.get("reextraction_recommended", bool(critical_missing) or len(anomalies) > 0)
+            ),
+            "auditor_notes": str(
+                qa.get(
+                    "auditor_notes",
+                    " ; ".join(fallback_notes) if fallback_notes else "Automated coherence checks completed.",
+                )
+            ),
+        }
+
+        doc_id = (extraction_results[0] if extraction_results else {}).get("document_id", f"docpkg-{app_id}")
+        event = QualityAssessmentCompleted(
+            package_id=package_id,
+            document_id=doc_id,
+            overall_confidence=qa_result["overall_confidence"],
+            is_coherent=qa_result["is_coherent"],
+            anomalies=qa_result["anomalies"],
+            critical_missing_fields=qa_result["critical_missing_fields"],
+            reextraction_recommended=qa_result["reextraction_recommended"],
+            auditor_notes=qa_result["auditor_notes"],
+            assessed_at=datetime.now(),
+        ).to_store_dict()
+        await self._append_stream(f"docpkg-{app_id}", event, causation_id=self.session_id)
+
+        ms = int((time.time() - t) * 1000)
+        _LOG_DOC.info(
+            "docproc_assess_quality_done application_id=%s coherent=%s confidence=%.3f reextract=%s anomalies=%s",
+            app_id,
+            qa_result["is_coherent"],
+            qa_result["overall_confidence"],
+            qa_result["reextraction_recommended"],
+            len(qa_result["anomalies"]),
+        )
+        await self._record_node_execution(
+            "assess_quality",
+            ["extraction_results"],
+            ["quality_assessment", "quality_flags"],
+            ms,
+            ti,
+            to,
+            cost,
+        )
+        return {
+            **state,
+            "quality_assessment": qa_result,
+            "quality_flags": qa_result["critical_missing_fields"] + qa_result["anomalies"],
+        }
+
+    async def _node_write_output(self, state: DocProcState) -> DocProcState:
+        t = time.time()
+        app_id = state["application_id"]
+        _LOG_DOC.info("docproc_write_output_start application_id=%s", app_id)
+        package_id = state.get("package_id") or app_id
+        extraction_results = list(state.get("extraction_results") or [])
+        qa = state.get("quality_assessment") or {}
+        quality_flags = list(state.get("quality_flags") or [])
+
+        ready = PackageReadyForAnalysis(
+            package_id=package_id,
+            application_id=app_id,
+            documents_processed=len(extraction_results),
+            has_quality_flags=bool(quality_flags),
+            quality_flag_count=len(quality_flags),
+            ready_at=datetime.now(),
+        ).to_store_dict()
+        await self._append_stream(f"docpkg-{app_id}", ready, causation_id=self.session_id)
+
+        credit_requested = CreditAnalysisRequested(
+            application_id=app_id,
+            requested_at=datetime.now(),
+            requested_by="DocumentProcessingAgent",
+            priority="HIGH" if qa.get("reextraction_recommended") else "NORMAL",
+        ).to_store_dict()
+        await self._append_stream(f"loan-{app_id}", credit_requested, causation_id=self.session_id)
+
+        events_written = [
+            {"stream_id": f"docpkg-{app_id}", "event_type": "PackageReadyForAnalysis", "stream_position": -1},
+            {"stream_id": f"loan-{app_id}", "event_type": "CreditAnalysisRequested", "stream_position": -1},
+        ]
+        summary = (
+            f"Processed {len(extraction_results)} required financial docs; "
+            f"quality_flags={len(quality_flags)}; credit analysis requested."
+        )
+        await self._record_output_written(events_written, summary)
+        ms = int((time.time() - t) * 1000)
+        await self._record_node_execution("write_output", ["quality_assessment"], ["events_written"], ms)
+        _LOG_DOC.info(
+            "docproc_write_output_done application_id=%s next_agent=credit_analysis docs_processed=%s",
+            app_id,
+            len(extraction_results),
+        )
+        return {
+            **state,
+            "output_events": events_written,
+            "next_agent": "credit_analysis",
+            "next_agent_triggered": "credit_analysis",
+        }
 
 
 # ─── FRAUD DETECTION AGENT ───────────────────────────────────────────────────
