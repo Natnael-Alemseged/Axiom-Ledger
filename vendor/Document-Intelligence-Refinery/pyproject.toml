@@ -1,0 +1,47 @@
+[build-system]
+requires = ["setuptools>=61", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "refinery"
+version = "0.1.0"
+description = "Document Intelligence Refinery - Triage Agent and Document Profiling"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+    "pydantic>=2",
+    "pdfplumber>=0.10",
+    "docling>=2",
+    "langdetect>=1.0",
+    "pyyaml>=6",
+    "httpx>=0.24",
+    "pymupdf>=1.23",
+    "tiktoken>=0.5",
+    "chromadb>=0.4",
+    "sentence-transformers>=2.2",
+    "langgraph>=0.2",
+    "langchain-core>=0.3",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=7",
+]
+
+[project.scripts]
+refinery-triage = "refinery.cli:main"
+
+[project.urls]
+Repository = "."
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["src"]
+
+[dependency-groups]
+dev = [
+    "pytest>=7",
+]

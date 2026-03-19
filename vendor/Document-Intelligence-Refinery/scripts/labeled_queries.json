@@ -1,0 +1,5 @@
+[
+  {"query": "capital expenditure Q3", "relevant_chunk_ids": ["305dd23363bce7af508e746ed3f83cca8a9c6ea9838cef21baf19934ef924a62_f62c34e8", "305dd23363bce7af508e746ed3f83cca8a9c6ea9838cef21baf19934ef924a62_83102759"]},
+  {"query": "interoperable transactions", "relevant_chunk_ids": ["305dd23363bce7af508e746ed3f83cca8a9c6ea9838cef21baf19934ef924a62_deea22b6", "305dd23363bce7af508e746ed3f83cca8a9c6ea9838cef21baf19934ef924a62_8d5cb825"]},
+  {"query": "performance highlights", "relevant_chunk_ids": ["305dd23363bce7af508e746ed3f83cca8a9c6ea9838cef21baf19934ef924a62_c7490ca6"]}
+]

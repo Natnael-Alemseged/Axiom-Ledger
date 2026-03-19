@@ -1,0 +1,42 @@
+# Extraction rules and thresholds for Phase 2 multi-strategy engine.
+# Refer to DOMAIN_NOTES.md for rationale.
+# Vision: use only free/free-tier models (e.g. OpenRouter :free suffix).
+
+fast_text:
+  min_chars_per_page: 100   # Below: likely scan or empty page
+  max_image_ratio: 0.50     # Above: image-dominated page, escalate
+  min_char_density: 0.02    # Character area / page area; below = sparse
+  min_confidence: 0.5       # Per-document minimum to accept fast_text result
+
+confidence_escalation_threshold: 0.5   # Below this: try next strategy (layout -> vision)
+
+vision:
+  budget_per_document_usd: 1.0
+  # Free-tier only: OpenRouter :free variant (e.g. google/gemini-2.0-flash-exp:free)
+  model_cheap: "google/gemini-2.0-flash-exp:free"
+  model_quality: "google/gemini-2.0-flash-exp:free"
+  max_retries: 2
+
+# Chunking rules ("Constitution" for RAG-ready LDUs). Phase 3.
+chunking:
+  max_tokens_per_chunk: 512
+  max_tokens_for_list: 512
+  merge_short_text_chars: 80   # Merge adjacent text blocks below this length into one LDU
+  on_violation: "log"           # "raise" | "log" for ChunkValidator
+  section_heading_patterns:     # Regex list for detecting section headers (fallback)
+    - "^\\d+[.)]\\s+[A-Z]"
+    - "^[A-Z][a-z]+.*:$"
+  cross_ref_patterns:           # For resolving "Table N", "Figure N"
+    - "Table\\s+(\\d+)"
+    - "Figure\\s+(\\d+)"
+    - "see\\s+Table\\s+(\\d+)"
+    - "see\\s+Figure\\s+(\\d+)"
+
+# PageIndex tree: section summaries (Phase 3). Reuse vision model_cheap if not set.
+pageindex:
+  summary_model_id: null       # null = use vision.model_cheap
+  max_input_tokens: 1024
+  batch_size: 5                # Sections per batch for LLM calls
+  key_entities_enabled: false  # extract named entities per section (regex/LLM)
+  data_types_from_ldu: true    # derive data_types_present from LDU kinds
+  output_dir: null             # null = .refinery/pageindex

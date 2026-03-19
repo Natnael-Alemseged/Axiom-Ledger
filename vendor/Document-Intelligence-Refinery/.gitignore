@@ -1,0 +1,26 @@
+# Environment and secrets
+.env
+.venv
+env/
+venv/
+
+# Build and install
+*.egg-info/
+*.egg
+dist/
+build/
+uv.lock
+
+# Cache and tests
+.pytest_cache/
+__pycache__/
+*.pyc
+.mypy_cache/
+.ruff_cache/
+
+# IDE
+.idea/
+.vscode/
+
+# Refinery runtime (optional: keep profiles out of git)
+.refinery/

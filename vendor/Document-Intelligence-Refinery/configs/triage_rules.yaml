@@ -1,0 +1,33 @@
+# Triage rules and thresholds for document classification.
+# Used by the Triage Agent for origin_type and layout_complexity.
+
+# Character density: text area / page area (0..1).
+# Above high = native_digital; below low = scanned or empty.
+char_density:
+  low: 0.02    # below = likely scanned_image or empty
+  high: 0.15   # above = likely native_digital (if fonts are not OCR)
+
+# Image area / page area (0..1). Includes embedded raster images.
+image_ratio:
+  high: 0.25   # above = figure_heavy or scanned
+
+# Table bbox area / page area (0..1).
+table_ratio:
+  high: 0.20   # above = table_heavy
+
+# Figure-like area: (images + rects + curves) / page area (0..1).
+# Vector graphics (rects, curves) count toward figure_heavy.
+figure_ratio:
+  high: 0.25   # above = figure_heavy
+
+# Font name substrings that indicate OCR layer (scanned_searchable).
+# If chars exist with these fonts + high image ratio → searchable_scan.
+ocr_font_indicators:
+  - "T3"
+  - "OCR-A"
+  - "OCR-B"
+  - "Identity-H"
+
+# Page-level: if char density is low and no images/rects/curves, flag as:
+# empty_page (no content) or likely_handwritten (low density but some chars).
+empty_page_char_density_max: 0.005
