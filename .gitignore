@@ -22,5 +22,5 @@ _smoke_documents/
 .env.*
 !.env.example
 
-### Week 3 refinery local cache
+### Document refinery local cache
 .refinery/
