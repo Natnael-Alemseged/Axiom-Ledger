@@ -20,3 +20,7 @@ _smoke_documents/
 ### Secrets / local config
 .env
 .env.*
+!.env.example
+
+### Week 3 refinery local cache
+.refinery/
