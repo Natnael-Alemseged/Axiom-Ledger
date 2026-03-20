@@ -121,7 +121,53 @@ From the repo root (with PDFs under `documents/<COMPANY>/`):
 
 # Credit agent applicant id (defaults to same as --company):
 .venv/bin/python scripts/run_pipeline.py --app APEX-0001 --company COMP-019 --applicant-id COMP-019
+
+# All five agents (in-memory): document → credit → fraud → compliance → orchestrator
+.venv/bin/python scripts/run_pipeline.py --app APEX-VERIFY-001 --company COMP-019 --phase full --llm openrouter
+
+# Orchestrator phase alone: seeds from data/seed_events.jsonl if present, otherwise runs the same prereqs as full when the store is empty (needs DecisionRequested on loan-*).
+.venv/bin/python scripts/run_pipeline.py --app APEX-VERIFY-001 --company COMP-019 --phase orchestrator --llm stub
 ```
+
+### Logging (colors + visibility)
+
+- **Colored stderr** when: TTY + `colorlog` installed (`pip install -r requirements.txt`) + not `NO_COLOR=1`.
+- **Plain file** when using `--log-file` (no ANSI in the file).
+- **Disable colors:** `--no-color` or `NO_COLOR=1`.
+
+```bash
+.venv/bin/python scripts/run_pipeline.py --app APEX-0001 --company COMP-019 --phase full --llm openrouter -v --log-file pipeline.log
+```
+
+**Filter a saved log** (agent lifecycle + streams + session events):
+
+```bash
+rg 'agent_run_|stream_append|session_event|AgentSession' pipeline.log
+```
+
+**Other tips:** narrow loggers with `LOG_LEVEL=DEBUG` only for `ledger` (set in code), or use `less -R` if piping colored output.
+
+### Deliverable verification (tests + DB)
+
+**Gate tests (no API keys required by default — uses stub LLM):**
+
+```bash
+.venv/bin/python -m pytest tests/test_narratives.py::test_narr01 tests/test_narratives.py::test_narr04 -v
+```
+
+Use **OpenRouter** from `.env` in tests (optional):
+
+```bash
+PYTEST_LLM=openrouter .venv/bin/python -m pytest tests/test_narratives.py::test_narr01 tests/test_narratives.py::test_narr04 -v
+```
+
+**Five terminal outcomes (orchestrator stub path):**
+
+```bash
+.venv/bin/python -m pytest tests/test_narratives.py::test_deliverable_five_terminal_states -v
+```
+
+**PostgreSQL** (after `datagen/generate_all.py` with `--db-url`): example queries are in `docs/verification_queries.sql` (decision counts, `ApplicationApproved` / `ApplicationDeclined`, compliance hard blocks).
 
 ### End-to-end smoke test: `DocumentProcessingAgent` (inline)
 
