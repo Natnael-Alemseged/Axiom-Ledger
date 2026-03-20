@@ -15,6 +15,7 @@ Pattern: follow CreditAnalysisAgent exactly. Same build_graph() structure,
 same _record_node_execution() calls, same _append_with_retry() for domain writes.
 """
 from __future__ import annotations
+from dataclasses import asdict, is_dataclass
 import logging
 import time, json
 from datetime import datetime
@@ -27,6 +28,7 @@ from langgraph.graph import StateGraph, END
 from ledger.agents.base_agent import BaseApexAgent
 from ledger.integrations.document_refinery_adapter import extract_financial_facts
 from ledger.schema.events import (
+    ComplianceCheckRequested,
     CreditAnalysisRequested,
     DocumentFormatRejected,
     DocumentFormatValidated,
@@ -35,6 +37,11 @@ from ledger.schema.events import (
     ExtractionFailed,
     ExtractionStarted,
     FinancialFacts,
+    FraudAnomaly,
+    FraudAnomalyDetected,
+    FraudAnomalyType,
+    FraudScreeningCompleted,
+    FraudScreeningInitiated,
     PackageReadyForAnalysis,
     QualityAssessmentCompleted,
 )
@@ -556,9 +563,11 @@ DO NOT make credit or lending decisions. DO NOT suggest loan outcomes.
 class FraudState(TypedDict):
     application_id: str
     session_id: str
+    applicant_id: str | None
     extracted_facts: dict | None
     registry_profile: dict | None
     historical_financials: list[dict] | None
+    year_over_year_deltas: dict | None
     fraud_signals: list[dict] | None
     fraud_score: float | None
     anomalies: list[dict] | None
@@ -629,16 +638,382 @@ class FraudDetectionAgent(BaseApexAgent):
     def _initial_state(self, application_id: str) -> FraudState:
         return FraudState(
             application_id=application_id, session_id=self.session_id,
+            applicant_id=None,
             extracted_facts=None, registry_profile=None, historical_financials=None,
+            year_over_year_deltas=None,
             fraud_signals=None, fraud_score=None, anomalies=None,
             errors=[], output_events=[], next_agent=None,
         )
 
-    async def _node_validate_inputs(self, state): raise NotImplementedError
-    async def _node_load_facts(self, state):      raise NotImplementedError
-    async def _node_cross_reference(self, state): raise NotImplementedError
-    async def _node_analyze(self, state):         raise NotImplementedError
-    async def _node_write_output(self, state):    raise NotImplementedError
+    @staticmethod
+    def _parse_json(text: str) -> dict[str, Any]:
+        raw = (text or "").strip()
+        try:
+            parsed = json.loads(raw)
+            return parsed if isinstance(parsed, dict) else {}
+        except Exception:
+            pass
+        start = raw.find("{")
+        end = raw.rfind("}")
+        if start >= 0 and end > start:
+            try:
+                parsed = json.loads(raw[start : end + 1])
+                return parsed if isinstance(parsed, dict) else {}
+            except Exception:
+                return {}
+        return {}
+
+    @staticmethod
+    def _to_float(value: Any, default: float = 0.0) -> float:
+        if value is None:
+            return default
+        if isinstance(value, (int, float)):
+            return float(value)
+        if isinstance(value, Decimal):
+            return float(value)
+        try:
+            return float(str(value))
+        except Exception:
+            return default
+
+    @staticmethod
+    def _normalize_anomaly_type(raw: str | None) -> str:
+        candidate = (raw or "").strip().lower()
+        allowed = {
+            FraudAnomalyType.REVENUE_DISCREPANCY.value,
+            FraudAnomalyType.BALANCE_SHEET_INCONSISTENCY.value,
+            FraudAnomalyType.UNUSUAL_SUBMISSION_PATTERN.value,
+            FraudAnomalyType.IDENTITY_MISMATCH.value,
+            FraudAnomalyType.DOCUMENT_ALTERATION_SUSPECTED.value,
+        }
+        return candidate if candidate in allowed else FraudAnomalyType.UNUSUAL_SUBMISSION_PATTERN.value
+
+    async def _node_validate_inputs(self, state):
+        t = time.time()
+        app_id = state["application_id"]
+        loan_events = await self.store.load_stream(f"loan-{app_id}")
+        errors: list[str] = []
+
+        if not any(e.get("event_type") == "FraudScreeningRequested" for e in loan_events):
+            errors.append("FraudScreeningRequested missing on loan stream.")
+        submitted = next((e for e in loan_events if e.get("event_type") == "ApplicationSubmitted"), None)
+        applicant_id = ((submitted or {}).get("payload") or {}).get("applicant_id")
+        if not applicant_id:
+            errors.append("ApplicationSubmitted missing or applicant_id unavailable.")
+
+        if errors:
+            await self._record_input_failed([], errors)
+            raise ValueError("; ".join(errors))
+
+        initiated = FraudScreeningInitiated(
+            application_id=app_id,
+            session_id=self.session_id,
+            screening_model_version=self.model,
+            initiated_at=datetime.now(),
+        ).to_store_dict()
+        await self._append_with_retry(f"fraud-{app_id}", [initiated], causation_id=self.session_id)
+
+        ms = int((time.time() - t) * 1000)
+        await self._record_input_validated(["application_id", "applicant_id", "fraud_screening_requested"], ms)
+        await self._record_node_execution(
+            "validate_inputs",
+            ["application_id"],
+            ["applicant_id"],
+            ms,
+        )
+        return {**state, "applicant_id": applicant_id}
+
+    async def _node_load_facts(self, state):
+        t = time.time()
+        app_id = state["application_id"]
+        pkg_events = await self.store.load_stream(f"docpkg-{app_id}")
+        extraction_events = [e for e in pkg_events if e.get("event_type") == "ExtractionCompleted"]
+        merged: dict[str, Any] = {}
+        for ev in extraction_events:
+            facts = (ev.get("payload") or {}).get("facts") or {}
+            for k, v in facts.items():
+                if v is not None and merged.get(k) is None:
+                    merged[k] = v
+
+        if not merged:
+            raise ValueError("No extracted FinancialFacts found in docpkg stream.")
+
+        ms = int((time.time() - t) * 1000)
+        await self._record_tool_call(
+            "load_event_store_stream",
+            f"stream_id=docpkg-{app_id} filter=ExtractionCompleted",
+            f"Loaded {len(extraction_events)} extraction events",
+            ms,
+        )
+        await self._record_node_execution(
+            "load_document_facts",
+            ["docpkg_stream"],
+            ["extracted_facts"],
+            ms,
+        )
+        return {**state, "extracted_facts": merged}
+
+    async def _node_cross_reference(self, state):
+        t = time.time()
+        applicant_id = state.get("applicant_id")
+        current = state.get("extracted_facts") or {}
+
+        profile: dict[str, Any] = {}
+        history: list[dict] = []
+        if self.registry is not None and applicant_id:
+            cp = await self.registry.get_company(applicant_id)
+            fh = await self.registry.get_financial_history(applicant_id)
+            profile = asdict(cp) if (cp and is_dataclass(cp)) else (dict(cp) if cp else {})
+            history = [asdict(x) if is_dataclass(x) else dict(x) for x in (fh or [])]
+
+        history = sorted(history, key=lambda x: int(x.get("fiscal_year", 0)))
+        prior = history[-1] if history else {}
+        current_revenue = self._to_float(current.get("total_revenue"))
+        current_ebitda = self._to_float(current.get("ebitda"))
+        current_margin = (current_ebitda / current_revenue) if current_revenue else 0.0
+        prior_revenue = self._to_float(prior.get("total_revenue"))
+        prior_ebitda = self._to_float(prior.get("ebitda"))
+        prior_margin = (prior_ebitda / prior_revenue) if prior_revenue else 0.0
+
+        deltas = {
+            "revenue_delta_abs": current_revenue - prior_revenue,
+            "revenue_delta_pct": ((current_revenue - prior_revenue) / prior_revenue) if prior_revenue else 0.0,
+            "ebitda_delta_abs": current_ebitda - prior_ebitda,
+            "ebitda_delta_pct": ((current_ebitda - prior_ebitda) / prior_ebitda) if prior_ebitda else 0.0,
+            "ebitda_margin_delta": current_margin - prior_margin,
+        }
+
+        ms = int((time.time() - t) * 1000)
+        await self._record_tool_call(
+            "query_applicant_registry",
+            f"company_id={applicant_id} table=financial_history years=3",
+            f"Loaded {len(history)} fiscal years",
+            ms,
+        )
+        await self._record_node_execution(
+            "cross_reference_registry",
+            ["extracted_facts", "applicant_id"],
+            ["historical_financials", "year_over_year_deltas"],
+            ms,
+        )
+        return {
+            **state,
+            "registry_profile": profile,
+            "historical_financials": history[-3:],
+            "year_over_year_deltas": deltas,
+        }
+
+    async def _node_analyze(self, state):
+        t = time.time()
+        deltas = state.get("year_over_year_deltas") or {}
+        current_facts = state.get("extracted_facts") or {}
+        history = state.get("historical_financials") or []
+
+        system = """You are a financial fraud analyst.
+Given extracted current-year figures and 3-year history, identify anomalous gaps.
+Return ONLY JSON:
+{
+  "anomalies":[
+    {"anomaly_type":"revenue_discrepancy|balance_sheet_inconsistency|unusual_submission_pattern|identity_mismatch|document_alteration_suspected",
+     "description":"string","severity":"LOW|MEDIUM|HIGH","evidence":"string","affected_fields":["field"]}
+  ],
+  "rationale":"string"
+}"""
+        user = (
+            f"Current-year extracted facts:\n{json.dumps(current_facts, default=str, indent=2)}\n\n"
+            f"Historical financials (up to 3 years):\n{json.dumps(history, default=str, indent=2)}\n\n"
+            f"Computed deltas:\n{json.dumps(deltas, default=str, indent=2)}"
+        )
+
+        ti: int | None = None
+        to: int | None = None
+        cost: float | None = None
+        anomalies: list[dict[str, Any]] = []
+        fraud_signals: list[dict[str, Any]] = []
+        try:
+            content, ti, to, cost = await self._call_llm(system, user, max_tokens=800)
+            parsed = self._parse_json(content)
+            anomalies = list(parsed.get("anomalies") or [])
+        except Exception as exc:
+            # Deterministic fallback from computed deltas if LLM is unavailable.
+            if abs(float(deltas.get("revenue_delta_pct", 0.0))) > 0.50:
+                anomalies.append(
+                    {
+                        "anomaly_type": FraudAnomalyType.REVENUE_DISCREPANCY.value,
+                        "description": "Current-year revenue differs materially from prior-year registry value.",
+                        "severity": "HIGH",
+                        "evidence": f"revenue_delta_pct={float(deltas.get('revenue_delta_pct', 0.0)):.2%}",
+                        "affected_fields": ["total_revenue"],
+                    }
+                )
+            assets = self._to_float(current_facts.get("total_assets"))
+            liabilities = self._to_float(current_facts.get("total_liabilities"))
+            equity = self._to_float(current_facts.get("total_equity"))
+            if assets and abs(assets - liabilities - equity) > max(assets * 0.02, 1.0):
+                anomalies.append(
+                    {
+                        "anomaly_type": FraudAnomalyType.BALANCE_SHEET_INCONSISTENCY.value,
+                        "description": "Balance sheet does not reconcile.",
+                        "severity": "MEDIUM",
+                        "evidence": f"assets({assets:.2f}) != liabilities+equity({(liabilities + equity):.2f})",
+                        "affected_fields": ["total_assets", "total_liabilities", "total_equity"],
+                    }
+                )
+            fraud_signals.append({"signal": "llm_unavailable", "detail": str(exc)[:200]})
+
+        severity_weights = {"LOW": 0.10, "MEDIUM": 0.25, "HIGH": 0.45}
+        score = 0.0
+        normalized: list[dict[str, Any]] = []
+        for raw in anomalies:
+            sev = str(raw.get("severity", "LOW")).upper()
+            if sev not in severity_weights:
+                sev = "LOW"
+            atype = self._normalize_anomaly_type(raw.get("anomaly_type"))
+            item = {
+                "anomaly_type": atype,
+                "description": str(raw.get("description") or "Potential anomaly detected"),
+                "severity": sev,
+                "evidence": str(raw.get("evidence") or "No explicit evidence supplied"),
+                "affected_fields": [str(x) for x in (raw.get("affected_fields") or [])],
+            }
+            normalized.append(item)
+            score += severity_weights[sev]
+
+        fraud_score = max(0.0, min(1.0, round(score, 4)))
+        if fraud_score > 0.60:
+            recommendation = "DECLINE"
+        elif fraud_score >= 0.30:
+            recommendation = "FLAG_FOR_REVIEW"
+        else:
+            recommendation = "PROCEED"
+        fraud_signals.append(
+            {
+                "severity_weight_sum": score,
+                "fraud_score": fraud_score,
+                "recommendation": recommendation,
+            }
+        )
+
+        ms = int((time.time() - t) * 1000)
+        await self._record_node_execution(
+            "analyze_fraud_patterns",
+            ["extracted_facts", "historical_financials", "year_over_year_deltas"],
+            ["anomalies", "fraud_score", "fraud_signals"],
+            ms,
+            ti,
+            to,
+            cost,
+        )
+        return {
+            **state,
+            "anomalies": normalized,
+            "fraud_score": fraud_score,
+            "fraud_signals": fraud_signals,
+        }
+
+    async def _node_write_output(self, state):
+        t = time.time()
+        app_id = state["application_id"]
+        anomalies = list(state.get("anomalies") or [])
+        fraud_score = float(state.get("fraud_score") or 0.0)
+        if fraud_score > 0.60:
+            recommendation = "DECLINE"
+            risk_level = "HIGH"
+        elif fraud_score >= 0.30:
+            recommendation = "FLAG_FOR_REVIEW"
+            risk_level = "MEDIUM"
+        else:
+            recommendation = "PROCEED"
+            risk_level = "LOW"
+
+        fraud_events: list[dict] = []
+        for a in anomalies:
+            sev = str(a.get("severity", "LOW")).upper()
+            if sev in {"MEDIUM", "HIGH"}:
+                fraud_events.append(
+                    FraudAnomalyDetected(
+                        application_id=app_id,
+                        session_id=self.session_id,
+                        anomaly=FraudAnomaly(
+                            anomaly_type=FraudAnomalyType(self._normalize_anomaly_type(a.get("anomaly_type"))),
+                            description=str(a.get("description") or ""),
+                            severity=sev,
+                            evidence=str(a.get("evidence") or ""),
+                            affected_fields=[str(x) for x in (a.get("affected_fields") or [])],
+                        ),
+                        detected_at=datetime.now(),
+                    ).to_store_dict()
+                )
+
+        fraud_events.append(
+            FraudScreeningCompleted(
+                application_id=app_id,
+                session_id=self.session_id,
+                fraud_score=fraud_score,
+                risk_level=risk_level,
+                anomalies_found=len(anomalies),
+                recommendation=recommendation,
+                screening_model_version=self.model,
+                input_data_hash=self._sha(
+                    {
+                        "extracted_facts": state.get("extracted_facts"),
+                        "historical_financials": state.get("historical_financials"),
+                        "anomalies": anomalies,
+                    }
+                ),
+                completed_at=datetime.now(),
+            ).to_store_dict()
+        )
+        fraud_positions = await self._append_with_retry(
+            f"fraud-{app_id}",
+            fraud_events,
+            causation_id=self.session_id,
+        )
+
+        compliance_requested = ComplianceCheckRequested(
+            application_id=app_id,
+            requested_at=datetime.now(),
+            triggered_by_event_id=self.session_id,
+            regulation_set_version="2026-Q1-v1",
+            rules_to_evaluate=["REG-001", "REG-002", "REG-003", "REG-004", "REG-005", "REG-006"],
+        ).to_store_dict()
+        comp_positions = await self._append_with_retry(
+            f"loan-{app_id}",
+            [compliance_requested],
+            causation_id=self.session_id,
+        )
+
+        events_written = [
+            {
+                "stream_id": f"fraud-{app_id}",
+                "event_type": e["event_type"],
+                "stream_position": fraud_positions[idx] if idx < len(fraud_positions) else -1,
+            }
+            for idx, e in enumerate(fraud_events)
+        ] + [
+            {
+                "stream_id": f"loan-{app_id}",
+                "event_type": "ComplianceCheckRequested",
+                "stream_position": comp_positions[0] if comp_positions else -1,
+            }
+        ]
+        await self._record_output_written(
+            events_written,
+            f"Fraud score={fraud_score:.2f} recommendation={recommendation}; compliance check requested.",
+        )
+        ms = int((time.time() - t) * 1000)
+        await self._record_node_execution(
+            "write_output",
+            ["anomalies", "fraud_score"],
+            ["events_written"],
+            ms,
+        )
+        return {
+            **state,
+            "output_events": events_written,
+            "next_agent": "compliance",
+            "next_agent_triggered": "compliance",
+        }
 
 
 # ─── COMPLIANCE AGENT ─────────────────────────────────────────────────────────
