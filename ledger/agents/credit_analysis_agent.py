@@ -34,6 +34,7 @@ WHEN THIS WORKS:
     → FraudScreeningRequested event on loan stream
 """
 from __future__ import annotations
+from dataclasses import asdict, is_dataclass
 import json
 import logging
 import time
@@ -45,6 +46,7 @@ from uuid import uuid4
 from langgraph.graph import StateGraph, END
 
 from ledger.agents.base_agent import BaseApexAgent
+from ledger.domain.aggregates.loan_application import LoanApplicationAggregate
 
 _LOG = logging.getLogger(__name__)
 from ledger.schema.events import (
@@ -163,21 +165,25 @@ class CreditAnalysisAgent(BaseApexAgent):
                 "(e.g. scripts/run_pipeline.py --phase all)."
             )
 
-        # Load LoanApplicationAggregate to get applicant_id and amounts
-        # TODO: implement LoanApplicationAggregate.load()
-
-        # PLACEHOLDER — remove when LoanApplicationAggregate is implemented
-        if self._applicant_id_override:
-            state["applicant_id"] = self._applicant_id_override
-        else:
-            state["applicant_id"] = f"COMP-001"
-        state["requested_amount_usd"] = 500_000.0
-        state["loan_purpose"]         = "working_capital"
+        # Load aggregate context (applicant identity + requested terms).
+        agg = await LoanApplicationAggregate.load(self.store, app_id)
+        state["applicant_id"] = self._applicant_id_override or agg.applicant_id
+        state["requested_amount_usd"] = float(agg.requested_amount_usd or 0.0)
+        state["loan_purpose"] = agg.loan_purpose
+        if not state["applicant_id"]:
+            errors.append("ApplicationSubmitted not found or applicant_id missing on loan stream.")
+        if state["requested_amount_usd"] <= 0:
+            if self._applicant_id_override:
+                state["requested_amount_usd"] = 500_000.0
+            else:
+                errors.append("ApplicationSubmitted missing valid requested_amount_usd.")
+        if not state["loan_purpose"]:
+            state["loan_purpose"] = "working_capital"
 
         # Verify package is ready
-        # TODO: pkg = await DocumentPackageAggregate.load(self.store, app_id)
-        # if not pkg.is_ready_for_analysis:
-        #     errors.append("Document package not ready")
+        pkg_events = await self.store.load_stream(f"docpkg-{app_id}")
+        if not any(e.get("event_type") == "PackageReadyForAnalysis" for e in pkg_events):
+            errors.append("PackageReadyForAnalysis missing on docpkg stream.")
 
         ms = int((time.time() - t) * 1000)
         if errors:
@@ -224,20 +230,38 @@ class CreditAnalysisAgent(BaseApexAgent):
         t = time.time()
         applicant_id = state["applicant_id"]
 
-        # Query Applicant Registry (read-only external database)
-        # TODO: implement RegistryClient methods
-        # profile   = await self.registry.get_company(applicant_id)
-        # financials = await self.registry.get_financial_history(applicant_id)
-        # flags     = await self.registry.get_compliance_flags(applicant_id)
-        # loans     = await self.registry.get_loan_relationships(applicant_id)
-
-        # PLACEHOLDER
-        profile    = {"company_id": applicant_id, "name": "Company",
-                      "industry": "technology", "trajectory": "STABLE",
-                      "legal_type": "LLC", "jurisdiction": "CA"}
+        profile: dict | None = None
         financials: list[dict] = []
-        flags:      list[dict] = []
-        loans:      list[dict] = []
+        flags: list[dict] = []
+        loans: list[dict] = []
+
+        # Query Applicant Registry (read-only external database).
+        # Keep a deterministic fallback for in-memory demo runs where registry=None.
+        if self.registry is not None:
+            try:
+                p = await self.registry.get_company(applicant_id)
+                f = await self.registry.get_financial_history(applicant_id)
+                c = await self.registry.get_compliance_flags(applicant_id)
+                l = await self.registry.get_loan_relationships(applicant_id)
+                profile = asdict(p) if is_dataclass(p) else (dict(p) if p else None)
+                financials = [asdict(x) if is_dataclass(x) else dict(x) for x in (f or [])]
+                flags = [asdict(x) if is_dataclass(x) else dict(x) for x in (c or [])]
+                loans = [asdict(x) if is_dataclass(x) else dict(x) for x in (l or [])]
+            except NotImplementedError:
+                _LOG.warning("Registry client methods are not implemented; using fallback profile")
+            except Exception:
+                _LOG.exception("Applicant registry query failed for applicant_id=%s", applicant_id)
+                raise
+
+        if profile is None:
+            profile = {
+                "company_id": applicant_id,
+                "name": "Company",
+                "industry": "technology",
+                "trajectory": "STABLE",
+                "legal_type": "LLC",
+                "jurisdiction": "CA",
+            }
 
         ms = int((time.time() - t) * 1000)
         await self._record_tool_call(
@@ -443,7 +467,7 @@ Provide your analysis as JSON."""
         ms = int((time.time() - t) * 1000)
         await self._record_node_execution(
             "analyze_credit_risk",
-            ["historical_financials", "extracted_facts", "company_profile", "loan_request"],
+            ["historical_financials", "current_year_facts", "loan_request"],
             ["credit_decision"],
             ms, ti, to, cost,
         )
@@ -460,9 +484,12 @@ Provide your analysis as JSON."""
         viols:  list[str] = []
 
         # Policy 1: loan-to-revenue cap
-        if hist:
-            rev = hist[-1].get("total_revenue", 0)
-            cap = int(rev * 0.35)
+        annual_revenue = (
+            (state.get("extracted_facts") or {}).get("total_revenue")
+            or (hist[-1].get("total_revenue", 0) if hist else 0)
+        )
+        if annual_revenue:
+            cap = int(float(annual_revenue) * 0.35)
             if cap > 0 and d.get("recommended_limit_usd", 0) > cap:
                 d["recommended_limit_usd"] = cap
                 viols.append(f"POLICY_REV_CAP: limit capped at 35% of revenue (${cap:,.0f})")
