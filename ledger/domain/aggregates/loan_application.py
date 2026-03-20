@@ -55,19 +55,25 @@ class LoanApplicationAggregate:
     loan_purpose: str | None = None
     version: int = 0
     events: list[dict] = field(default_factory=list)
+    compliance_overall_verdict: str | None = None
+    has_hard_block: bool = False
 
     @classmethod
     async def load(cls, store, application_id: str) -> "LoanApplicationAggregate":
         """Load and replay event stream to rebuild aggregate state."""
         agg = cls(application_id=application_id)
-        # TODO: stream_events = await store.load_stream(f"loan-{application_id}")
-        # TODO: for event in stream_events: agg.apply(event)
+        stream_events = await store.load_stream(f"loan-{application_id}")
+        for event in stream_events:
+            agg.apply(event)
         return agg
 
     def apply(self, event: dict) -> None:
-        """Apply one event to update aggregate state. TODO: implement for each event type."""
-        et = event.get("event_type"); p = event.get("payload", {})
+        """Apply one event to update aggregate state."""
+        et = event.get("event_type")
+        p = event.get("payload", {})
         self.version += 1
+        self.events.append(event)
+
         if et == "ApplicationSubmitted":
             self.state = ApplicationState.SUBMITTED
             self.applicant_id = p.get("applicant_id")
@@ -77,9 +83,61 @@ class LoanApplicationAggregate:
             self.state = ApplicationState.DOCUMENTS_PENDING
         elif et == "DocumentUploaded":
             self.state = ApplicationState.DOCUMENTS_UPLOADED
-        # TODO: implement remaining transitions
+        elif et == "CreditAnalysisRequested":
+            self.state = ApplicationState.CREDIT_ANALYSIS_REQUESTED
+        elif et == "FraudScreeningRequested":
+            self.state = ApplicationState.FRAUD_SCREENING_REQUESTED
+        elif et == "ComplianceCheckRequested":
+            self.state = ApplicationState.COMPLIANCE_CHECK_REQUESTED
+        elif et == "ComplianceCheckCompleted":
+            self.state = ApplicationState.COMPLIANCE_CHECK_COMPLETE
+            self.compliance_overall_verdict = str(p.get("overall_verdict", ""))
+            self.has_hard_block = bool(p.get("has_hard_block", False))
+        elif et == "DecisionRequested":
+            self.state = ApplicationState.PENDING_DECISION
+        elif et == "DecisionGenerated":
+            recommendation = str(p.get("recommendation", ""))
+            confidence = float(p.get("confidence", 0.0))
+            self.assert_valid_orchestrator_decision(
+                recommendation=recommendation,
+                confidence=confidence,
+            )
+            if recommendation == "APPROVE":
+                self.state = ApplicationState.APPROVED
+            elif recommendation == "DECLINE":
+                self.state = ApplicationState.DECLINED
+            elif recommendation == "REFER":
+                self.state = ApplicationState.REFERRED
+        elif et == "HumanReviewRequested":
+            self.state = ApplicationState.PENDING_HUMAN_REVIEW
+        elif et == "ApplicationApproved":
+            self.state = ApplicationState.APPROVED
+        elif et == "ApplicationDeclined":
+            reasons = [str(r) for r in (p.get("decline_reasons") or [])]
+            if any("compliance" in r.lower() for r in reasons):
+                self.state = ApplicationState.DECLINED_COMPLIANCE
+            else:
+                self.state = ApplicationState.DECLINED
 
     def assert_valid_transition(self, target: ApplicationState) -> None:
         allowed = VALID_TRANSITIONS.get(self.state, [])
         if target not in allowed:
             raise ValueError(f"Invalid transition {self.state} → {target}. Allowed: {allowed}")
+
+    def assert_valid_orchestrator_decision(self, recommendation: str, confidence: float) -> None:
+        """
+        Enforce hard orchestrator decision constraints at aggregate level.
+
+        Required policy:
+        - confidence < 0.60 must never be APPROVE.
+        """
+        rec = (recommendation or "").upper()
+        if confidence < 0.60 and rec == "APPROVE":
+            raise ValueError(
+                "Invalid DecisionGenerated: recommendation=APPROVE is not allowed "
+                "when confidence < 0.60."
+            )
+        if self.compliance_overall_verdict == "BLOCKED" and rec != "DECLINE":
+            raise ValueError(
+                "Invalid DecisionGenerated: compliance BLOCKED requires recommendation=DECLINE."
+            )
