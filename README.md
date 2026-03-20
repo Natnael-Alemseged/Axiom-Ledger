@@ -149,16 +149,16 @@ rg 'agent_run_|stream_append|session_event|AgentSession' pipeline.log
 
 ### Deliverable verification (tests + DB)
 
-**Gate tests (no API keys required by default — uses stub LLM):**
+**Gate tests (all five narratives; no API keys required by default — uses stub LLM):**
 
 ```bash
-.venv/bin/python -m pytest tests/test_narratives.py::test_narr01 tests/test_narratives.py::test_narr04 -v
+.venv/bin/python -m pytest tests/test_narratives.py::test_narr01 tests/test_narratives.py::test_narr02 tests/test_narratives.py::test_narr03 tests/test_narratives.py::test_narr04 tests/test_narratives.py::test_narr05 -v
 ```
 
 Use **OpenRouter** from `.env` in tests (optional):
 
 ```bash
-PYTEST_LLM=openrouter .venv/bin/python -m pytest tests/test_narratives.py::test_narr01 tests/test_narratives.py::test_narr04 -v
+PYTEST_LLM=openrouter .venv/bin/python -m pytest tests/test_narratives.py::test_narr01 tests/test_narratives.py::test_narr02 tests/test_narratives.py::test_narr03 tests/test_narratives.py::test_narr04 tests/test_narratives.py::test_narr05 -v
 ```
 
 **Five terminal outcomes (orchestrator stub path):**
