@@ -503,6 +503,7 @@ Provide your analysis as JSON."""
         req      = state.get("requested_amount_usd") or 0
         flags    = state.get("compliance_flags") or []
         loans    = state.get("loan_history") or []
+        q_flags  = state.get("quality_flags") or []
         viols:  list[str] = []
 
         # Policy 1: loan-to-revenue cap
@@ -527,6 +528,16 @@ Provide your analysis as JSON."""
             if d.get("confidence", 0) > 0.50:
                 d["confidence"] = 0.50
                 viols.append("POLICY_COMPLIANCE_FLAG: confidence capped at 0.50")
+
+        # Policy 4: critical extraction gaps (e.g. missing EBITDA) must cap confidence and surface caveats
+        if q_flags:
+            has_critical_missing = any(str(f).startswith("CRITICAL_MISSING:") for f in q_flags)
+            if has_critical_missing and d.get("confidence", 0) > 0.75:
+                d["confidence"] = 0.75
+                viols.append("POLICY_DATA_QUALITY: confidence capped at 0.75")
+            existing = list(d.get("data_quality_caveats") or [])
+            if not existing:
+                d["data_quality_caveats"] = [str(f) for f in q_flags[:5]]
 
         if viols:
             d["policy_overrides_applied"] = d.get("policy_overrides_applied", []) + viols

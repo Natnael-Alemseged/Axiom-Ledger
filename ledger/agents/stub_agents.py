@@ -53,6 +53,7 @@ from ledger.schema.events import (
     FraudScreeningCompleted,
     FraudScreeningInitiated,
     HumanReviewRequested,
+    AgentSessionRecovered,
     PackageReadyForAnalysis,
     QualityAssessmentCompleted,
 )
@@ -60,6 +61,13 @@ from ledger.schema.events import (
 _LOG_DOC = logging.getLogger(__name__)
 _LOG_COMP = logging.getLogger(__name__)
 _LOG_ORCH = logging.getLogger(__name__)
+
+
+class RecoverableAgentCrash(RuntimeError):
+    def __init__(self, message: str, *, last_successful_node: str):
+        super().__init__(message)
+        self.last_successful_node = last_successful_node
+        self.recoverable = True
 
 
 # ─── DOCUMENT PROCESSING AGENT ───────────────────────────────────────────────
@@ -648,6 +656,68 @@ class FraudDetectionAgent(BaseApexAgent):
         g.add_edge("write_output",             END)
         return g.compile()
 
+    def __init__(self, agent_id, agent_type, store, registry, client, model="claude-sonnet-4-20250514"):
+        super().__init__(agent_id, agent_type, store, registry, client, model)
+        self._crash_after_node: str | None = None
+        self._resume_from_node: str | None = None
+        self._recovered_from_session_id: str | None = None
+        self._recovered_extracted_facts: dict[str, Any] | None = None
+
+    def _simulate_crash_after_node(self, node_name: str) -> None:
+        self._crash_after_node = node_name
+
+    async def reconstruct_agent_context(self, crashed_session_id: str) -> dict[str, Any]:
+        stream_id = f"agent-{self.agent_type}-{crashed_session_id}"
+        events = await self.store.load_stream(stream_id)
+        last_node = None
+        for ev in events:
+            if ev.get("event_type") == "AgentNodeExecuted":
+                payload = ev.get("payload") or {}
+                last_node = payload.get("node_name")
+        failed = next((e for e in reversed(events) if e.get("event_type") == "AgentSessionFailed"), None)
+        failed_payload = (failed or {}).get("payload") or {}
+        return {
+            "crashed_session_id": crashed_session_id,
+            "last_successful_node": failed_payload.get("last_successful_node") or last_node,
+            "recoverable": bool(failed_payload.get("recoverable", False)),
+        }
+
+    async def recover_from_session(self, application_id: str, crashed_session_id: str) -> dict[str, Any]:
+        ctx = await self.reconstruct_agent_context(crashed_session_id)
+        last_node = str(ctx.get("last_successful_node") or "")
+        if "load_facts" in last_node or "load_document_facts" in last_node:
+            self._resume_from_node = "cross_reference_registry"
+        else:
+            self._resume_from_node = None
+        self._recovered_from_session_id = crashed_session_id
+        self._context_source = f"prior_session_replay:{crashed_session_id}"
+
+        if self._resume_from_node == "cross_reference_registry":
+            pkg_events = await self.store.load_stream(f"docpkg-{application_id}")
+            merged: dict[str, Any] = {}
+            for ev in pkg_events:
+                if ev.get("event_type") != "ExtractionCompleted":
+                    continue
+                facts = (ev.get("payload") or {}).get("facts") or {}
+                for k, v in facts.items():
+                    if v is not None and merged.get(k) is None:
+                        merged[k] = v
+            self._recovered_extracted_facts = merged or None
+        return ctx
+
+    async def _start_session(self, app_id: str):
+        await super()._start_session(app_id)
+        if self._recovered_from_session_id:
+            recovered = AgentSessionRecovered(
+                session_id=self.session_id,
+                agent_type=self.agent_type,
+                application_id=app_id,
+                recovered_from_session_id=self._recovered_from_session_id,
+                recovery_point=self._resume_from_node or "unknown",
+                recovered_at=datetime.now(),
+            ).to_store_dict()
+            await self._append_session(recovered)
+
     def _initial_state(self, application_id: str) -> FraudState:
         return FraudState(
             application_id=application_id, session_id=self.session_id,
@@ -737,6 +807,10 @@ class FraudDetectionAgent(BaseApexAgent):
         return {**state, "applicant_id": applicant_id}
 
     async def _node_load_facts(self, state):
+        if self._resume_from_node in {"cross_reference_registry", "analyze_fraud_patterns", "write_output"}:
+            facts = self._recovered_extracted_facts or (state.get("extracted_facts") or {})
+            return {**state, "extracted_facts": facts}
+
         t = time.time()
         app_id = state["application_id"]
         pkg_events = await self.store.load_stream(f"docpkg-{app_id}")
@@ -764,6 +838,11 @@ class FraudDetectionAgent(BaseApexAgent):
             ["extracted_facts"],
             ms,
         )
+        if self._crash_after_node in {"load_facts", "load_document_facts"}:
+            raise RecoverableAgentCrash(
+                "Simulated crash after load_facts",
+                last_successful_node="load_facts",
+            )
         return {**state, "extracted_facts": merged}
 
     async def _node_cross_reference(self, state):

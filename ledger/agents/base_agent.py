@@ -45,6 +45,8 @@ class BaseApexAgent(ABC):
         self.session_id = None; self.application_id = None
         self._session_stream = None; self._t0 = None
         self._seq = 0; self._llm_calls = 0; self._tokens = 0; self._cost = 0.0
+        self._last_successful_node: str | None = None
+        self._context_source: str = "fresh"
         self._graph = None
 
     @abstractmethod
@@ -56,6 +58,7 @@ class BaseApexAgent(ABC):
         self.session_id = f"sess-{self.agent_type[:3]}-{uuid4().hex[:8]}"
         self._session_stream = f"agent-{self.agent_type}-{self.session_id}"
         self._t0 = time.perf_counter(); self._seq = 0; self._llm_calls = 0; self._tokens = 0; self._cost = 0.0
+        self._last_successful_node = None
         _LOG.info(
             "agent_run_start agent_type=%s session_id=%s application_id=%s model=%s",
             self.agent_type, self.session_id, application_id, self.model,
@@ -65,7 +68,13 @@ class BaseApexAgent(ABC):
             result = await self._graph.ainvoke(self._initial_state(application_id))
             await self._complete_session(result)
         except Exception as e:
-            await self._fail_session(type(e).__name__, str(e)); raise
+            await self._fail_session(
+                type(e).__name__,
+                str(e),
+                last_successful_node=getattr(e, "last_successful_node", None),
+                recoverable=getattr(e, "recoverable", None),
+            )
+            raise
 
     def _initial_state(self, app_id):
         return {"application_id": app_id, "session_id": self.session_id,
@@ -75,10 +84,11 @@ class BaseApexAgent(ABC):
         await self._append_session({"event_type":"AgentSessionStarted","event_version":1,"payload":{
             "session_id":self.session_id,"agent_type":self.agent_type,"agent_id":self.agent_id,
             "application_id":app_id,"model_version":self.model,"langgraph_graph_version":LANGGRAPH_VERSION,
-            "context_source":"fresh","context_token_count":1000,"started_at":datetime.now().isoformat()}})
+            "context_source":self._context_source,"context_token_count":1000,"started_at":datetime.now().isoformat()}})
 
     async def _record_node_execution(self, name, in_keys, out_keys, ms, tok_in=None, tok_out=None, cost=None):
         self._seq += 1
+        self._last_successful_node = name
         if tok_in is not None and tok_out is not None:
             self._tokens += (tok_in or 0) + (tok_out or 0)
             self._llm_calls += 1
@@ -116,18 +126,19 @@ class BaseApexAgent(ABC):
             self.agent_type, self.session_id, self.application_id, ms, self._seq, next_agent,
         )
 
-    async def _fail_session(self, etype, emsg):
+    async def _fail_session(self, etype, emsg, last_successful_node: str | None = None, recoverable: bool | None = None):
         _LOG.error(
             "agent_run_failed agent_type=%s session_id=%s application_id=%s error_type=%s message=%s",
             self.agent_type, self.session_id, self.application_id, etype, emsg[:500],
         )
+        last_node = last_successful_node or self._last_successful_node or (f"node_{self._seq}" if self._seq else None)
+        rec = recoverable if recoverable is not None else etype in ("llm_timeout","RateLimitError")
         await self._append_session({"event_type":"AgentSessionFailed","event_version":1,"payload":{
             "session_id":self.session_id,"agent_type":self.agent_type,"application_id":self.application_id,
-            "error_type":etype,"error_message":emsg[:500],"last_successful_node":f"node_{self._seq}",
-            "recoverable":etype in ("llm_timeout","RateLimitError"),"failed_at":datetime.now().isoformat()}})
+            "error_type":etype,"error_message":emsg[:500],"last_successful_node":last_node,
+            "recoverable":rec,"failed_at":datetime.now().isoformat()}})
 
     async def _append_session(self, event: dict):
-        """TODO: replace print with actual EventStore.append() call"""
         et = event.get("event_type", "?")
         pl = event.get("payload") or {}
         _LOG.info(
@@ -139,6 +150,28 @@ class BaseApexAgent(ABC):
             pl.get("llm_called"),
         )
         _LOG.debug("session_event_payload=%s", json.dumps(event, default=str)[:2000])
+        if self._session_stream:
+            for attempt in range(MAX_OCC_RETRIES):
+                try:
+                    ver = await self.store.stream_version(self._session_stream)
+                    await self.store.append(
+                        stream_id=self._session_stream,
+                        events=[event],
+                        expected_version=ver,
+                        causation_id=self.session_id,
+                    )
+                    break
+                except Exception as e:
+                    if "OptimisticConcurrencyError" in type(e).__name__ and attempt < MAX_OCC_RETRIES - 1:
+                        await asyncio.sleep(0.05 * (2**attempt))
+                        continue
+                    _LOG.warning(
+                        "session_event_append_failed stream=%s event_type=%s error=%s",
+                        self._session_stream,
+                        et,
+                        type(e).__name__,
+                    )
+                    break
         print(f"  [{self.agent_type[:8]}:{self.session_id}] {event['event_type']}")
 
     async def _append_stream(self, stream_id: str, event_dict: dict, causation_id: str = None):
