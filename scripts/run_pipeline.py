@@ -2,8 +2,12 @@
 Run ledger agents against an in-memory event store (no DB required).
 
 Phases:
-  document — seed corpus + DocumentProcessingAgent (refinery extraction + quality LLM).
-  all      — document, then CreditAnalysisAgent (reads ExtractionCompleted from docpkg stream).
+  document      — seed corpus + DocumentProcessingAgent (refinery extraction + quality LLM).
+  all           — document + CreditAnalysisAgent.
+  fraud         — FraudDetectionAgent (requires prior credit; FraudScreeningRequested on loan).
+  compliance    — ComplianceAgent (requires prior fraud; ComplianceCheckRequested on loan).
+  orchestrator  — DecisionOrchestratorAgent (loads seed or runs doc→credit→fraud→compliance if needed).
+  full          — document → credit → fraud → compliance → orchestrator (all 5 agents).
 
 Usage:
   .venv/bin/python scripts/run_pipeline.py --application APEX-0001 --phase all --company COMP-019
@@ -20,12 +24,15 @@ LLM (--llm):
 
 Logging:
   --log-level DEBUG / -v — adapter + agent DEBUG lines.
-  --log-file pipeline.log — capture full flow.
+  --log-file pipeline.log — capture full flow (plain text; no ANSI in file).
+  --no-color — plain stderr (also respect NO_COLOR=1).
+  Colored stderr when TTY + colorlog installed (pip install colorlog).
 """
 from __future__ import annotations
 
 import argparse
 import asyncio
+import json
 import logging
 import os
 import sys
@@ -41,20 +48,11 @@ from dotenv import load_dotenv
 load_dotenv(ROOT / ".env")
 
 
-def _configure_logging(level: str, log_file: str | None) -> None:
+def _configure_logging(level: str, log_file: str | None, *, color: bool | None) -> None:
+    from ledger.logging_config import configure_apex_logging
+
     lvl = getattr(logging, level.upper(), logging.INFO)
-    handlers: list[logging.Handler] = [logging.StreamHandler(sys.stderr)]
-    if log_file:
-        handlers.append(logging.FileHandler(log_file, encoding="utf-8"))
-    logging.basicConfig(
-        level=lvl,
-        format="%(asctime)s %(levelname)s [%(name)s] %(message)s",
-        datefmt="%Y-%m-%dT%H:%M:%S",
-        handlers=handlers,
-        force=True,
-    )
-    logging.getLogger("httpx").setLevel(logging.WARNING)
-    logging.getLogger("httpcore").setLevel(logging.WARNING)
+    configure_apex_logging(lvl, log_file=log_file, color=color)
 
 
 class PipelineStubLLM:
@@ -81,6 +79,22 @@ class PipelineStubLLM:
   "key_concerns": ["Applicant registry data is placeholder — tune applicant_id and registry client for real runs."],
   "data_quality_caveats": [],
   "policy_overrides_applied": []
+}"""
+            elif "financial fraud analyst" in sys:
+                txt = """{
+  "anomalies": [],
+  "rationale": "Stub fraud analysis — no anomalies flagged."
+}"""
+            elif "compliance reporting assistant" in sys:
+                txt = "Stub compliance summary: regulatory checks completed per policy."
+            elif "senior loan officer" in sys or "synthesizing multi-agent" in sys:
+                txt = """{
+  "recommendation": "APPROVE",
+  "approved_amount_usd": 400000,
+  "confidence": 0.78,
+  "executive_summary": "Stub orchestrator: credit, fraud, and compliance inputs support a routine approval subject to standard conditions.",
+  "key_risks": ["Monitor financial reporting as conditions warrant."],
+  "conditions": ["Monthly financial reporting required"]
 }"""
             else:
                 txt = "{}"
@@ -187,6 +201,149 @@ def _make_llm_client(backend: str):
 
         return OpenRouterShimClient()
     raise ValueError(f"Unknown LLM backend: {backend}")
+
+
+def _seed_jsonl_record_matches_application(rec: dict, application_id: str) -> bool:
+    """Match seed_events.jsonl lines to an application (stream suffix or payload)."""
+    sid = rec.get("stream_id") or ""
+    if sid.endswith(f"-{application_id}"):
+        return True
+    pl = rec.get("payload") or {}
+    if pl.get("application_id") == application_id:
+        return True
+    return False
+
+
+async def load_seed_jsonl_for_application(store, application_id: str, path: Path) -> int:
+    """
+    Replay matching lines from a JSONL seed file into the in-memory store (preserves file order / OCC).
+    Returns number of events appended.
+    """
+    if not path.is_file():
+        return 0
+    n = 0
+    with path.open(encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                rec = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if not _seed_jsonl_record_matches_application(rec, application_id):
+                continue
+            stream_id = rec.get("stream_id")
+            if not stream_id:
+                continue
+            ev = {
+                "event_type": rec["event_type"],
+                "event_version": rec.get("event_version", 1),
+                "payload": dict(rec.get("payload") or {}),
+            }
+            ver = await store.stream_version(stream_id)
+            await store.append(stream_id, [ev], expected_version=ver)
+            n += 1
+    return n
+
+
+async def _application_streams_empty(store, application_id: str) -> bool:
+    for prefix in ("loan", "docpkg", "credit", "fraud", "compliance"):
+        if await store.load_stream(f"{prefix}-{application_id}"):
+            return False
+    return True
+
+
+async def _has_credit_analysis_completed(store, application_id: str) -> bool:
+    ev = await store.load_stream(f"credit-{application_id}")
+    return any(e.get("event_type") == "CreditAnalysisCompleted" for e in ev)
+
+
+async def _has_fraud_completed(store, application_id: str) -> bool:
+    ev = await store.load_stream(f"fraud-{application_id}")
+    return any(e.get("event_type") == "FraudScreeningCompleted" for e in ev)
+
+
+async def _has_compliance_completed(store, application_id: str) -> bool:
+    ev = await store.load_stream(f"compliance-{application_id}")
+    return any(e.get("event_type") == "ComplianceCheckCompleted" for e in ev)
+
+
+async def ensure_orchestrator_prerequisites(
+    store,
+    application_id: str,
+    company: str,
+    applicant_id: str,
+    llm_backend: str,
+) -> None:
+    """
+    Orchestrator requires DecisionRequested on the loan stream (written by ComplianceAgent when
+    there is no hard block). If missing, load data/seed_events.jsonl for this application_id, or
+    run the same prerequisite chain as ``--phase full`` (or fraud/compliance only if credit is
+    already complete).
+    """
+    log = logging.getLogger(__name__)
+
+    def _has_decision_requested(loan_events: list) -> bool:
+        return any(e.get("event_type") == "DecisionRequested" for e in loan_events)
+
+    loan = await store.load_stream(f"loan-{application_id}")
+    if _has_decision_requested(loan):
+        return
+
+    seed_path = ROOT / "data" / "seed_events.jsonl"
+    n = await load_seed_jsonl_for_application(store, application_id, seed_path)
+    if n:
+        log.info(
+            "orchestrator_prereq: loaded %s seed events from %s for application_id=%s",
+            n,
+            seed_path,
+            application_id,
+        )
+    loan = await store.load_stream(f"loan-{application_id}")
+    if _has_decision_requested(loan):
+        return
+
+    if await _application_streams_empty(store, application_id):
+        log.info(
+            "orchestrator_prereq: empty store — running document → credit → fraud → compliance "
+            "before orchestrator (application_id=%s)",
+            application_id,
+        )
+        await run_document_phase(store, application_id, company, llm_backend)
+        await _ensure_application_submitted(store, application_id, applicant_id)
+        await run_credit_phase(store, application_id, applicant_id, llm_backend)
+        await run_fraud_phase(store, application_id, llm_backend)
+        await run_compliance_phase(store, application_id, llm_backend)
+    else:
+        if not await _has_credit_analysis_completed(store, application_id):
+            raise SystemExit(
+                "Orchestrator phase needs prior credit analysis (and usually document processing). "
+                "Run: --phase full\n"
+                f"  or: --phase all --application {application_id}  then --phase fraud, compliance, orchestrator."
+            )
+        if not await _has_fraud_completed(store, application_id):
+            log.info("orchestrator_prereq: running fraud + compliance (credit already complete)")
+            await run_fraud_phase(store, application_id, llm_backend)
+            await run_compliance_phase(store, application_id, llm_backend)
+        elif not await _has_compliance_completed(store, application_id):
+            log.info("orchestrator_prereq: running compliance only (fraud already complete)")
+            await run_compliance_phase(store, application_id, llm_backend)
+        else:
+            raise SystemExit(
+                "Loan stream has no DecisionRequested but credit/fraud/compliance streams look complete. "
+                "Compliance may have hard-declined (ApplicationDeclined instead of DecisionRequested). "
+                "Check compliance output or use a different application / company."
+            )
+
+    loan = await store.load_stream(f"loan-{application_id}")
+    if not _has_decision_requested(loan):
+        declined = any(e.get("event_type") == "ApplicationDeclined" for e in loan)
+        raise SystemExit(
+            "Orchestrator requires DecisionRequested on loan-* (from ComplianceAgent when there is no "
+            f"hard compliance block). application_id={application_id}: DecisionRequested missing, "
+            f"ApplicationDeclined on loan={declined}."
+        )
 
 
 def _default_model_for_backend(backend: str) -> str:
@@ -315,6 +472,41 @@ async def run_document_phase(
     log.info("event_types=%s", [e["event_type"] for e in loan])
 
 
+async def _ensure_application_submitted(
+    store,
+    application_id: str,
+    applicant_id: str,
+) -> None:
+    """Append ApplicationSubmitted if missing so LoanApplicationAggregate and credit agent have context."""
+    stream_id = f"loan-{application_id}"
+    loan_events = await store.load_stream(stream_id)
+    if any(e.get("event_type") == "ApplicationSubmitted" for e in loan_events):
+        return
+    ver = await store.stream_version(stream_id)
+    await store.append(
+        stream_id,
+        [
+            {
+                "event_type": "ApplicationSubmitted",
+                "event_version": 1,
+                "payload": {
+                    "application_id": application_id,
+                    "applicant_id": applicant_id,
+                    "requested_amount_usd": "500000",
+                    "loan_purpose": "working_capital",
+                    "loan_term_months": 36,
+                    "submission_channel": "WEB",
+                    "contact_email": "applicant@example.com",
+                    "contact_name": "Applicant",
+                    "submitted_at": datetime.now().isoformat(),
+                    "application_reference": f"REF-{application_id}",
+                },
+            }
+        ],
+        expected_version=ver,
+    )
+
+
 async def run_credit_phase(
     store,
     application_id: str,
@@ -352,14 +544,102 @@ async def run_credit_phase(
     log.info("event_types=%s", [e["event_type"] for e in loan])
 
 
+async def run_fraud_phase(
+    store,
+    application_id: str,
+    llm_backend: str,
+) -> None:
+    from ledger.agents.stub_agents import FraudDetectionAgent
+
+    log = logging.getLogger(__name__)
+    client = _make_llm_client(llm_backend)
+    model = _default_model_for_backend(llm_backend)
+    log.info("fraud_phase llm_backend=%s model=%s", llm_backend, model)
+    agent = FraudDetectionAgent(
+        "agent-fraud-cli",
+        "fraud_detection",
+        store,
+        registry=None,
+        client=client,
+        model=model,
+    )
+    await agent.process_application(application_id)
+    fraud = await store.load_stream(f"fraud-{application_id}")
+    loan = await store.load_stream(f"loan-{application_id}")
+    log.info("--- summary: fraud-%s ---", application_id)
+    log.info("event_types=%s", [e["event_type"] for e in fraud])
+    log.info("--- summary: loan-%s (after fraud) ---", application_id)
+    log.info("event_types=%s", [e["event_type"] for e in loan])
+
+
+async def run_compliance_phase(
+    store,
+    application_id: str,
+    llm_backend: str,
+) -> None:
+    from ledger.agents.stub_agents import ComplianceAgent
+
+    log = logging.getLogger(__name__)
+    client = _make_llm_client(llm_backend)
+    model = _default_model_for_backend(llm_backend)
+    log.info("compliance_phase llm_backend=%s model=%s", llm_backend, model)
+    agent = ComplianceAgent(
+        "agent-compliance-cli",
+        "compliance",
+        store,
+        registry=None,
+        client=client,
+        model=model,
+    )
+    await agent.process_application(application_id)
+    comp = await store.load_stream(f"compliance-{application_id}")
+    loan = await store.load_stream(f"loan-{application_id}")
+    log.info("--- summary: compliance-%s ---", application_id)
+    log.info("event_types=%s", [e["event_type"] for e in comp])
+    log.info("--- summary: loan-%s (after compliance) ---", application_id)
+    log.info("event_types=%s", [e["event_type"] for e in loan])
+
+
+async def run_orchestrator_phase(
+    store,
+    application_id: str,
+    llm_backend: str,
+) -> None:
+    from ledger.agents.stub_agents import DecisionOrchestratorAgent
+
+    log = logging.getLogger(__name__)
+    client = _make_llm_client(llm_backend)
+    model = _default_model_for_backend(llm_backend)
+    log.info("orchestrator_phase llm_backend=%s model=%s", llm_backend, model)
+    agent = DecisionOrchestratorAgent(
+        "agent-orch-cli",
+        "decision_orchestrator",
+        store,
+        registry=None,
+        client=client,
+        model=model,
+    )
+    await agent.process_application(application_id)
+    loan = await store.load_stream(f"loan-{application_id}")
+    log.info("--- summary: loan-%s (after orchestrator) ---", application_id)
+    log.info("event_types=%s", [e["event_type"] for e in loan])
+
+
 async def main() -> None:
     p = argparse.ArgumentParser(description="Run Axiom Ledger pipeline (in-memory store).")
     p.add_argument("--application", "--app", dest="application", required=True, help="Application id (stream suffix)")
     p.add_argument(
         "--phase",
         default="all",
-        choices=("document", "all"),
-        help="document = doc processing only; all = document then credit analysis",
+        choices=(
+            "document",
+            "all",
+            "fraud",
+            "compliance",
+            "orchestrator",
+            "full",
+        ),
+        help="Pipeline phase: document | all (doc+credit) | fraud | compliance | orchestrator | full (5 agents)",
     )
     p.add_argument(
         "--company",
@@ -379,10 +659,19 @@ async def main() -> None:
     )
     p.add_argument("--log-level", default="INFO", help="DEBUG, INFO, WARNING, …")
     p.add_argument("--log-file", default=None, help="Optional log file path")
+    p.add_argument(
+        "--no-color",
+        action="store_true",
+        help="Disable ANSI colors on stderr (file logs are always plain)",
+    )
     p.add_argument("-v", "--verbose", action="store_true", help="Shorthand for --log-level DEBUG")
     args = p.parse_args()
 
-    _configure_logging("DEBUG" if args.verbose else args.log_level, args.log_file)
+    _configure_logging(
+        "DEBUG" if args.verbose else args.log_level,
+        args.log_file,
+        color=False if args.no_color else None,
+    )
 
     log = logging.getLogger(__name__)
     llm_backend = _resolve_llm_backend(args.llm)
@@ -414,10 +703,30 @@ async def main() -> None:
 
     store = InMemoryEventStore()
 
-    await run_document_phase(store, args.application, args.company, llm_backend)
-
-    if args.phase == "all":
+    if args.phase == "document":
+        await run_document_phase(store, args.application, args.company, llm_backend)
+    elif args.phase == "all":
+        await run_document_phase(store, args.application, args.company, llm_backend)
+        await _ensure_application_submitted(store, args.application, applicant_id)
         await run_credit_phase(store, args.application, applicant_id, llm_backend)
+    elif args.phase == "fraud":
+        await run_fraud_phase(store, args.application, llm_backend)
+    elif args.phase == "compliance":
+        await run_compliance_phase(store, args.application, llm_backend)
+    elif args.phase == "orchestrator":
+        await ensure_orchestrator_prerequisites(
+            store, args.application, args.company, applicant_id, llm_backend
+        )
+        await run_orchestrator_phase(store, args.application, llm_backend)
+    elif args.phase == "full":
+        await run_document_phase(store, args.application, args.company, llm_backend)
+        await _ensure_application_submitted(store, args.application, applicant_id)
+        await run_credit_phase(store, args.application, applicant_id, llm_backend)
+        await run_fraud_phase(store, args.application, llm_backend)
+        await run_compliance_phase(store, args.application, llm_backend)
+        await run_orchestrator_phase(store, args.application, llm_backend)
+    else:
+        raise SystemExit(f"Unhandled phase: {args.phase}")
 
     log.info("run_pipeline finished ok application_id=%s", args.application)
 

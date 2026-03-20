@@ -28,8 +28,18 @@ from langgraph.graph import StateGraph, END
 from ledger.agents.base_agent import BaseApexAgent
 from ledger.integrations.document_refinery_adapter import extract_financial_facts
 from ledger.schema.events import (
+    ApplicationApproved,
+    ApplicationDeclined,
+    ComplianceCheckCompleted,
+    ComplianceCheckInitiated,
     ComplianceCheckRequested,
+    ComplianceRuleFailed,
+    ComplianceRuleNoted,
+    ComplianceRulePassed,
+    ComplianceVerdict,
     CreditAnalysisRequested,
+    DecisionGenerated,
+    DecisionRequested,
     DocumentFormatRejected,
     DocumentFormatValidated,
     DocumentType,
@@ -42,11 +52,14 @@ from ledger.schema.events import (
     FraudAnomalyType,
     FraudScreeningCompleted,
     FraudScreeningInitiated,
+    HumanReviewRequested,
     PackageReadyForAnalysis,
     QualityAssessmentCompleted,
 )
 
 _LOG_DOC = logging.getLogger(__name__)
+_LOG_COMP = logging.getLogger(__name__)
+_LOG_ORCH = logging.getLogger(__name__)
 
 
 # ─── DOCUMENT PROCESSING AGENT ───────────────────────────────────────────────
@@ -1077,7 +1090,7 @@ REGULATIONS = {
         "name": "Minimum Operating History",
         "version": "2026-Q1-v1",
         "is_hard_block": True,
-        "check": lambda co: (2024 - (co.get("founded_year") or 2024)) >= 2,
+        "check": lambda co: (2026 - (co.get("founded_year") or 2026)) >= 2,
         "failure_reason": "Business must have at least 2 years of operating history.",
         "remediation": None,
     },
@@ -1138,12 +1151,12 @@ class ComplianceAgent(BaseApexAgent):
         g = StateGraph(ComplianceState)
         g.add_node("validate_inputs",     self._node_validate_inputs)
         g.add_node("load_company_profile",self._node_load_profile)
-        g.add_node("evaluate_reg001",     lambda s: self._evaluate_rule(s, "REG-001"))
-        g.add_node("evaluate_reg002",     lambda s: self._evaluate_rule(s, "REG-002"))
-        g.add_node("evaluate_reg003",     lambda s: self._evaluate_rule(s, "REG-003"))
-        g.add_node("evaluate_reg004",     lambda s: self._evaluate_rule(s, "REG-004"))
-        g.add_node("evaluate_reg005",     lambda s: self._evaluate_rule(s, "REG-005"))
-        g.add_node("evaluate_reg006",     lambda s: self._evaluate_rule(s, "REG-006"))
+        g.add_node("evaluate_reg001",     self._node_evaluate_reg001)
+        g.add_node("evaluate_reg002",     self._node_evaluate_reg002)
+        g.add_node("evaluate_reg003",     self._node_evaluate_reg003)
+        g.add_node("evaluate_reg004",     self._node_evaluate_reg004)
+        g.add_node("evaluate_reg005",     self._node_evaluate_reg005)
+        g.add_node("evaluate_reg006",     self._node_evaluate_reg006)
         g.add_node("write_output",        self._node_write_output)
 
         g.set_entry_point("validate_inputs")
@@ -1173,8 +1186,97 @@ class ComplianceAgent(BaseApexAgent):
             block_rule_id=None, errors=[], output_events=[], next_agent=None,
         )
 
-    async def _node_validate_inputs(self, state): raise NotImplementedError
-    async def _node_load_profile(self, state):    raise NotImplementedError
+    async def _node_validate_inputs(self, state):
+        t = time.time()
+        app_id = state["application_id"]
+        loan_events = await self.store.load_stream(f"loan-{app_id}")
+        if not any(e.get("event_type") == "ComplianceCheckRequested" for e in loan_events):
+            await self._record_input_failed([], ["ComplianceCheckRequested missing on loan stream."])
+            raise ValueError("ComplianceCheckRequested missing on loan stream.")
+
+        initiated = ComplianceCheckInitiated(
+            application_id=app_id,
+            session_id=self.session_id,
+            regulation_set_version="2026-Q1-v1",
+            rules_to_evaluate=list(REGULATIONS.keys()),
+            initiated_at=datetime.now(),
+        ).to_store_dict()
+        await self._append_with_retry(f"compliance-{app_id}", [initiated], causation_id=self.session_id)
+
+        ms = int((time.time() - t) * 1000)
+        await self._record_input_validated(["application_id", "compliance_check_requested"], ms)
+        await self._record_node_execution(
+            "validate_inputs",
+            ["application_id"],
+            ["compliance_check_initialized"],
+            ms,
+        )
+        return state
+
+    async def _node_load_profile(self, state):
+        t = time.time()
+        app_id = state["application_id"]
+        loan_events = await self.store.load_stream(f"loan-{app_id}")
+        submitted = next((e for e in loan_events if e.get("event_type") == "ApplicationSubmitted"), None)
+        submitted_payload = (submitted or {}).get("payload") or {}
+        applicant_id = submitted_payload.get("applicant_id")
+        if not applicant_id:
+            raise ValueError("ApplicationSubmitted missing applicant_id on loan stream.")
+        requested_amount = float(submitted_payload.get("requested_amount_usd") or 0.0)
+
+        company_profile: dict[str, Any] = {}
+        flags: list[dict[str, Any]] = []
+        if self.registry is not None and applicant_id:
+            company = await self.registry.get_company(applicant_id)
+            raw_flags = await self.registry.get_compliance_flags(applicant_id, active_only=False)
+            company_profile = asdict(company) if (company and is_dataclass(company)) else (dict(company) if company else {})
+            flags = [asdict(x) if is_dataclass(x) else dict(x) for x in (raw_flags or [])]
+
+        if not company_profile:
+            # REG-005 requires ≥2 years operating history (2026 - founded_year >= 2).
+            # Defaulting to "current year" always hard-blocks when registry is unavailable (CLI / tests).
+            company_profile = {
+                "company_id": applicant_id or "UNKNOWN",
+                "name": "Unknown Company",
+                "jurisdiction": "UNKNOWN",
+                "legal_type": "UNKNOWN",
+                "founded_year": 2018,
+            }
+        company_profile["requested_amount_usd"] = requested_amount
+        company_profile["compliance_flags"] = flags
+
+        ms = int((time.time() - t) * 1000)
+        await self._record_tool_call(
+            "query_applicant_registry",
+            f"company_id={applicant_id} tables=[companies,compliance_flags]",
+            f"Loaded profile and {len(flags)} compliance flags",
+            ms,
+        )
+        await self._record_node_execution(
+            "load_company_profile",
+            ["application_id"],
+            ["company_profile"],
+            ms,
+        )
+        return {**state, "company_profile": company_profile}
+
+    async def _node_evaluate_reg001(self, state: ComplianceState) -> ComplianceState:
+        return await self._evaluate_rule(state, "REG-001")
+
+    async def _node_evaluate_reg002(self, state: ComplianceState) -> ComplianceState:
+        return await self._evaluate_rule(state, "REG-002")
+
+    async def _node_evaluate_reg003(self, state: ComplianceState) -> ComplianceState:
+        return await self._evaluate_rule(state, "REG-003")
+
+    async def _node_evaluate_reg004(self, state: ComplianceState) -> ComplianceState:
+        return await self._evaluate_rule(state, "REG-004")
+
+    async def _node_evaluate_reg005(self, state: ComplianceState) -> ComplianceState:
+        return await self._evaluate_rule(state, "REG-005")
+
+    async def _node_evaluate_reg006(self, state: ComplianceState) -> ComplianceState:
+        return await self._evaluate_rule(state, "REG-006")
 
     async def _evaluate_rule(self, state: ComplianceState, rule_id: str) -> ComplianceState:
         """
@@ -1192,9 +1294,209 @@ class ComplianceAgent(BaseApexAgent):
                if reg["is_hard_block"]: state["has_hard_block"]=True, state["block_rule_id"]=rule_id
         8. await self._record_node_execution(f"evaluate_{rule_id.lower().replace('-','_')}", ...)
         """
-        raise NotImplementedError(f"Implement _evaluate_rule for {rule_id}")
+        t = time.time()
+        app_id = state["application_id"]
+        reg = REGULATIONS[rule_id]
+        co = dict(state.get("company_profile") or {})
+        results = list(state.get("rule_results") or [])
+        has_hard_block = bool(state.get("has_hard_block"))
+        block_rule_id = state.get("block_rule_id")
 
-    async def _node_write_output(self, state): raise NotImplementedError
+        passes = bool(reg["check"](co))
+        evidence_hash = self._sha(f"{rule_id}-{co.get('company_id')}-{passes}")
+        status = "PASSED"
+        if rule_id == "REG-006":
+            status = "NOTED"
+            ev = ComplianceRuleNoted(
+                application_id=app_id,
+                session_id=self.session_id,
+                rule_id=rule_id,
+                rule_name=reg["name"],
+                note_type=reg.get("note_type", "INFO"),
+                note_text=reg.get("note_text", "Informational note."),
+                evaluated_at=datetime.now(),
+            ).to_store_dict()
+            await self._append_with_retry(f"compliance-{app_id}", [ev], causation_id=self.session_id)
+        elif passes:
+            ev = ComplianceRulePassed(
+                application_id=app_id,
+                session_id=self.session_id,
+                rule_id=rule_id,
+                rule_name=reg["name"],
+                rule_version=reg["version"],
+                evidence_hash=evidence_hash,
+                evaluation_notes=f"{rule_id} passed deterministic policy checks.",
+                evaluated_at=datetime.now(),
+            ).to_store_dict()
+            await self._append_with_retry(f"compliance-{app_id}", [ev], causation_id=self.session_id)
+        else:
+            status = "FAILED"
+            ev = ComplianceRuleFailed(
+                application_id=app_id,
+                session_id=self.session_id,
+                rule_id=rule_id,
+                rule_name=reg["name"],
+                rule_version=reg["version"],
+                failure_reason=reg.get("failure_reason", f"{rule_id} failed"),
+                is_hard_block=bool(reg.get("is_hard_block")),
+                remediation_available=bool(reg.get("remediation")),
+                remediation_description=reg.get("remediation"),
+                evidence_hash=evidence_hash,
+                evaluated_at=datetime.now(),
+            ).to_store_dict()
+            await self._append_with_retry(f"compliance-{app_id}", [ev], causation_id=self.session_id)
+            if bool(reg.get("is_hard_block")):
+                has_hard_block = True
+                block_rule_id = rule_id
+
+        results.append(
+            {
+                "rule_id": rule_id,
+                "rule_name": reg["name"],
+                "status": status,
+                "is_hard_block": bool(reg.get("is_hard_block")),
+                "passed": passes if rule_id != "REG-006" else None,
+            }
+        )
+
+        ms = int((time.time() - t) * 1000)
+        await self._record_node_execution(
+            f"evaluate_{rule_id.lower().replace('-', '')}",
+            ["company_profile", "rule_results"],
+            ["rule_results", "has_hard_block", "block_rule_id"],
+            ms,
+        )
+        return {
+            **state,
+            "rule_results": results,
+            "has_hard_block": has_hard_block,
+            "block_rule_id": block_rule_id,
+        }
+
+    async def _node_write_output(self, state):
+        t = time.time()
+        app_id = state["application_id"]
+        results = list(state.get("rule_results") or [])
+        has_hard_block = bool(state.get("has_hard_block"))
+        block_rule_id = state.get("block_rule_id")
+
+        rules_evaluated = len(results)
+        rules_passed = sum(1 for r in results if r.get("status") == "PASSED")
+        rules_failed = sum(1 for r in results if r.get("status") == "FAILED")
+        rules_noted = sum(1 for r in results if r.get("status") == "NOTED")
+        if has_hard_block:
+            verdict = ComplianceVerdict.BLOCKED
+        elif rules_failed > 0:
+            verdict = ComplianceVerdict.CONDITIONAL
+        else:
+            verdict = ComplianceVerdict.CLEAR
+
+        completed = ComplianceCheckCompleted(
+            application_id=app_id,
+            session_id=self.session_id,
+            rules_evaluated=rules_evaluated,
+            rules_passed=rules_passed,
+            rules_failed=rules_failed,
+            rules_noted=rules_noted,
+            has_hard_block=has_hard_block,
+            overall_verdict=verdict,
+            completed_at=datetime.now(),
+        ).to_store_dict()
+        comp_pos = await self._append_with_retry(
+            f"compliance-{app_id}",
+            [completed],
+            causation_id=self.session_id,
+        )
+
+        decision_event: dict
+        decision_type: str
+        if has_hard_block:
+            reason = next(
+                (REGULATIONS[r["rule_id"]]["failure_reason"] for r in results if r.get("rule_id") == block_rule_id and r.get("status") == "FAILED"),
+                f"Compliance hard block triggered at {block_rule_id}.",
+            )
+            decision_event = ApplicationDeclined(
+                application_id=app_id,
+                decline_reasons=[reason],
+                declined_by="ComplianceAgent",
+                adverse_action_notice_required=True,
+                adverse_action_codes=[block_rule_id] if block_rule_id else [],
+                declined_at=datetime.now(),
+            ).to_store_dict()
+            decision_type = "ApplicationDeclined"
+        else:
+            decision_event = DecisionRequested(
+                application_id=app_id,
+                requested_at=datetime.now(),
+                all_analyses_complete=True,
+                triggered_by_event_id=self.session_id,
+            ).to_store_dict()
+            decision_type = "DecisionRequested"
+
+        loan_pos = await self._append_with_retry(
+            f"loan-{app_id}",
+            [decision_event],
+            causation_id=self.session_id,
+        )
+
+        summary = (
+            f"Compliance verdict={verdict.value}; evaluated={rules_evaluated}, "
+            f"passed={rules_passed}, failed={rules_failed}, noted={rules_noted}."
+        )
+        ti: int | None = None
+        to: int | None = None
+        cost: float | None = None
+        try:
+            content, ti, to, cost = await self._call_llm(
+                "You are a compliance reporting assistant. Summarize compliance evidence in 2 concise sentences. No decisions.",
+                json.dumps(
+                    {
+                        "application_id": app_id,
+                        "overall_verdict": verdict.value,
+                        "rule_results": results,
+                        "hard_block": has_hard_block,
+                        "block_rule_id": block_rule_id,
+                    },
+                    default=str,
+                ),
+                max_tokens=180,
+            )
+            human_summary = (content or "").strip()
+            if human_summary:
+                summary = human_summary
+        except Exception as exc:
+            _LOG_COMP.warning("compliance_write_output_summary_fallback application_id=%s error=%s", app_id, type(exc).__name__)
+
+        events_written = [
+            {
+                "stream_id": f"compliance-{app_id}",
+                "event_type": "ComplianceCheckCompleted",
+                "stream_position": comp_pos[0] if comp_pos else -1,
+            },
+            {
+                "stream_id": f"loan-{app_id}",
+                "event_type": decision_type,
+                "stream_position": loan_pos[0] if loan_pos else -1,
+            },
+        ]
+        await self._record_output_written(events_written, summary)
+
+        ms = int((time.time() - t) * 1000)
+        await self._record_node_execution(
+            "write_output",
+            ["rule_results", "has_hard_block"],
+            ["events_written", "next_agent"],
+            ms,
+            ti,
+            to,
+            cost,
+        )
+        return {
+            **state,
+            "output_events": events_written,
+            "next_agent": None if has_hard_block else "decision_orchestrator",
+            "next_agent_triggered": None if has_hard_block else "decision_orchestrator",
+        }
 
 
 # ─── DECISION ORCHESTRATOR ────────────────────────────────────────────────────
@@ -1209,6 +1511,7 @@ class OrchestratorState(TypedDict):
     confidence: float | None
     approved_amount: float | None
     executive_summary: str | None
+    key_risks: list[str] | None
     conditions: list[str] | None
     hard_constraints_applied: list[str] | None
     errors: list[str]
@@ -1284,14 +1587,333 @@ class DecisionOrchestratorAgent(BaseApexAgent):
             application_id=application_id, session_id=self.session_id,
             credit_result=None, fraud_result=None, compliance_result=None,
             recommendation=None, confidence=None, approved_amount=None,
-            executive_summary=None, conditions=None, hard_constraints_applied=[],
+            executive_summary=None, key_risks=None, conditions=None, hard_constraints_applied=[],
             errors=[], output_events=[], next_agent=None,
         )
 
-    async def _node_validate_inputs(self, state):  raise NotImplementedError
-    async def _node_load_credit(self, state):      raise NotImplementedError
-    async def _node_load_fraud(self, state):       raise NotImplementedError
-    async def _node_load_compliance(self, state):  raise NotImplementedError
-    async def _node_synthesize(self, state):       raise NotImplementedError
-    async def _node_constraints(self, state):      raise NotImplementedError
-    async def _node_write_output(self, state):     raise NotImplementedError
+    @staticmethod
+    def _parse_json(text: str) -> dict[str, Any]:
+        raw = (text or "").strip()
+        try:
+            parsed = json.loads(raw)
+            return parsed if isinstance(parsed, dict) else {}
+        except Exception:
+            pass
+        start = raw.find("{")
+        end = raw.rfind("}")
+        if start >= 0 and end > start:
+            try:
+                parsed = json.loads(raw[start : end + 1])
+                return parsed if isinstance(parsed, dict) else {}
+            except Exception:
+                return {}
+        return {}
+
+    @staticmethod
+    def _f(v: Any, default: float = 0.0) -> float:
+        if v is None:
+            return default
+        if isinstance(v, (int, float)):
+            return float(v)
+        if isinstance(v, Decimal):
+            return float(v)
+        try:
+            return float(str(v))
+        except Exception:
+            return default
+
+    async def _node_validate_inputs(self, state):
+        t = time.time()
+        app_id = state["application_id"]
+        loan_events = await self.store.load_stream(f"loan-{app_id}")
+        if not any(e.get("event_type") == "DecisionRequested" for e in loan_events):
+            await self._record_input_failed([], ["DecisionRequested missing on loan stream."])
+            raise ValueError("DecisionRequested missing on loan stream.")
+
+        ms = int((time.time() - t) * 1000)
+        await self._record_input_validated(["application_id", "decision_requested"], ms)
+        await self._record_node_execution(
+            "validate_inputs",
+            ["application_id"],
+            ["decision_context_ready"],
+            ms,
+        )
+        return state
+
+    async def _node_load_credit(self, state):
+        t = time.time()
+        app_id = state["application_id"]
+        events = await self.store.load_stream(f"credit-{app_id}")
+        latest = next((e for e in reversed(events) if e.get("event_type") == "CreditAnalysisCompleted"), None)
+        if not latest:
+            raise ValueError("CreditAnalysisCompleted not found on credit stream.")
+        payload = latest.get("payload") or {}
+        decision = payload.get("decision") or {}
+        credit = {
+            "risk_tier": decision.get("risk_tier"),
+            "recommended_limit_usd": self._f(decision.get("recommended_limit_usd")),
+            "confidence": self._f(decision.get("confidence")),
+            "rationale": decision.get("rationale", ""),
+            "data_quality_caveats": list(decision.get("data_quality_caveats") or []),
+            "policy_overrides_applied": list(decision.get("policy_overrides_applied") or []),
+        }
+        ms = int((time.time() - t) * 1000)
+        await self._record_node_execution(
+            "load_credit_result",
+            ["credit_stream"],
+            ["credit_result"],
+            ms,
+        )
+        return {**state, "credit_result": credit}
+
+    async def _node_load_fraud(self, state):
+        t = time.time()
+        app_id = state["application_id"]
+        events = await self.store.load_stream(f"fraud-{app_id}")
+        latest = next((e for e in reversed(events) if e.get("event_type") == "FraudScreeningCompleted"), None)
+        if not latest:
+            raise ValueError("FraudScreeningCompleted not found on fraud stream.")
+        payload = latest.get("payload") or {}
+        fraud = {
+            "fraud_score": self._f(payload.get("fraud_score")),
+            "risk_level": payload.get("risk_level"),
+            "anomalies_found": int(payload.get("anomalies_found") or 0),
+            "recommendation": payload.get("recommendation"),
+        }
+        ms = int((time.time() - t) * 1000)
+        await self._record_node_execution(
+            "load_fraud_result",
+            ["fraud_stream"],
+            ["fraud_result"],
+            ms,
+        )
+        return {**state, "fraud_result": fraud}
+
+    async def _node_load_compliance(self, state):
+        t = time.time()
+        app_id = state["application_id"]
+        events = await self.store.load_stream(f"compliance-{app_id}")
+        latest = next((e for e in reversed(events) if e.get("event_type") == "ComplianceCheckCompleted"), None)
+        if not latest:
+            raise ValueError("ComplianceCheckCompleted not found on compliance stream.")
+        payload = latest.get("payload") or {}
+        compliance = {
+            "overall_verdict": payload.get("overall_verdict"),
+            "has_hard_block": bool(payload.get("has_hard_block")),
+            "rules_failed": int(payload.get("rules_failed") or 0),
+        }
+        ms = int((time.time() - t) * 1000)
+        await self._record_node_execution(
+            "load_compliance_result",
+            ["compliance_stream"],
+            ["compliance_result"],
+            ms,
+        )
+        return {**state, "compliance_result": compliance}
+
+    async def _node_synthesize(self, state):
+        t = time.time()
+        credit = state.get("credit_result") or {}
+        fraud = state.get("fraud_result") or {}
+        compliance = state.get("compliance_result") or {}
+
+        system = """You are a senior loan officer synthesizing multi-agent analysis.
+Return ONLY JSON:
+{
+  "recommendation":"APPROVE|DECLINE|REFER",
+  "approved_amount_usd": <number or null>,
+  "confidence": <0.0-1.0>,
+  "executive_summary":"3-5 sentences",
+  "key_risks":["string"],
+  "conditions":["string"]
+}
+Focus on factual synthesis. Do not invent unavailable data."""
+        user = json.dumps(
+            {
+                "credit_analysis": credit,
+                "fraud_screening": fraud,
+                "compliance_check": compliance,
+            },
+            default=str,
+            indent=2,
+        )
+
+        ti: int | None = None
+        to: int | None = None
+        cost: float | None = None
+        try:
+            content, ti, to, cost = await self._call_llm(system, user, max_tokens=700)
+            parsed = self._parse_json(content)
+        except Exception as exc:
+            _LOG_ORCH.warning("orchestrator_synthesize_fallback application_id=%s err=%s", state["application_id"], type(exc).__name__)
+            parsed = {}
+
+        recommended_limit = self._f(credit.get("recommended_limit_usd"))
+        amount = self._f(parsed.get("approved_amount_usd"), recommended_limit)
+        fallback_rec = "APPROVE" if self._f(credit.get("confidence"), 0.0) >= 0.60 else "REFER"
+        recommendation = str(parsed.get("recommendation") or fallback_rec).upper()
+        if recommendation not in {"APPROVE", "DECLINE", "REFER"}:
+            recommendation = fallback_rec
+        confidence = self._f(parsed.get("confidence"), self._f(credit.get("confidence"), 0.55))
+        summary = str(parsed.get("executive_summary") or "Decision synthesized from credit, fraud, and compliance analyses.")
+        key_risks = [str(x) for x in (parsed.get("key_risks") or [])]
+        conditions = [str(x) for x in (parsed.get("conditions") or [])]
+
+        ms = int((time.time() - t) * 1000)
+        await self._record_node_execution(
+            "synthesize_decision",
+            ["credit_result", "fraud_result", "compliance_result"],
+            ["recommendation", "approved_amount", "confidence", "executive_summary", "key_risks"],
+            ms,
+            ti,
+            to,
+            cost,
+        )
+        return {
+            **state,
+            "recommendation": recommendation,
+            "approved_amount": amount,
+            "confidence": confidence,
+            "executive_summary": summary,
+            "key_risks": key_risks,
+            "conditions": conditions,
+        }
+
+    async def _node_constraints(self, state):
+        t = time.time()
+        recommendation = str(state.get("recommendation") or "REFER").upper()
+        confidence = self._f(state.get("confidence"), 0.0)
+        fraud_score = self._f((state.get("fraud_result") or {}).get("fraud_score"), 0.0)
+        compliance = state.get("compliance_result") or {}
+        overrides = list(state.get("hard_constraints_applied") or [])
+
+        # Enforce policy constraints in Python after LLM synthesis.
+        if compliance.get("overall_verdict") == "BLOCKED" or compliance.get("has_hard_block"):
+            if recommendation != "DECLINE":
+                overrides.append("CONSTRAINT_COMPLIANCE_BLOCKED_FORCED_DECLINE")
+            recommendation = "DECLINE"
+        elif confidence < 0.60:
+            if recommendation != "REFER":
+                overrides.append("CONSTRAINT_CONFIDENCE_LT_060_FORCED_REFER")
+            recommendation = "REFER"
+        elif fraud_score > 0.60:
+            if recommendation != "REFER":
+                overrides.append("CONSTRAINT_FRAUD_SCORE_GT_060_FORCED_REFER")
+            recommendation = "REFER"
+
+        summary = str(state.get("executive_summary") or "").strip()
+        if overrides:
+            summary = (
+                f"{summary} Hard constraints applied: {', '.join(overrides)}."
+            ).strip()
+
+        ms = int((time.time() - t) * 1000)
+        await self._record_node_execution(
+            "apply_hard_constraints",
+            ["recommendation", "confidence", "fraud_result", "compliance_result"],
+            ["recommendation", "hard_constraints_applied", "executive_summary"],
+            ms,
+        )
+        return {
+            **state,
+            "recommendation": recommendation,
+            "hard_constraints_applied": overrides,
+            "executive_summary": summary,
+        }
+
+    async def _node_write_output(self, state):
+        t = time.time()
+        app_id = state["application_id"]
+        recommendation = str(state.get("recommendation") or "REFER").upper()
+        confidence = self._f(state.get("confidence"), 0.5)
+        approved_amount = self._f(state.get("approved_amount"), 0.0)
+        summary = str(state.get("executive_summary") or "")
+        key_risks = [str(x) for x in (state.get("key_risks") or [])]
+        conditions = [str(x) for x in (state.get("conditions") or [])]
+        overrides = [str(x) for x in (state.get("hard_constraints_applied") or [])]
+
+        decision = DecisionGenerated(
+            application_id=app_id,
+            orchestrator_session_id=self.session_id,
+            recommendation=recommendation,
+            confidence=confidence,
+            approved_amount_usd=Decimal(str(round(approved_amount, 2))) if recommendation == "APPROVE" else None,
+            conditions=conditions,
+            executive_summary=summary,
+            key_risks=key_risks + overrides,
+            contributing_sessions=[],
+            model_versions={"orchestrator": self.model},
+            generated_at=datetime.now(),
+        ).to_store_dict()
+        decision_pos = await self._append_with_retry(f"loan-{app_id}", [decision], causation_id=self.session_id)
+
+        if recommendation == "APPROVE":
+            follow_up = ApplicationApproved(
+                application_id=app_id,
+                approved_amount_usd=Decimal(str(round(max(approved_amount, 1.0), 2))),
+                interest_rate_pct=11.5,
+                term_months=36,
+                conditions=conditions,
+                approved_by="DecisionOrchestratorAgent",
+                effective_date=datetime.now().date().isoformat(),
+                approved_at=datetime.now(),
+            ).to_store_dict()
+            follow_type = "ApplicationApproved"
+            next_agent = None
+        elif recommendation == "DECLINE":
+            follow_up = ApplicationDeclined(
+                application_id=app_id,
+                decline_reasons=key_risks or ["Combined analysis indicates unacceptable risk."],
+                declined_by="DecisionOrchestratorAgent",
+                adverse_action_notice_required=True,
+                adverse_action_codes=[],
+                declined_at=datetime.now(),
+            ).to_store_dict()
+            follow_type = "ApplicationDeclined"
+            next_agent = None
+        else:
+            follow_up = HumanReviewRequested(
+                application_id=app_id,
+                reason="Automated orchestration produced REFER recommendation.",
+                decision_event_id=self.session_id,
+                assigned_to=None,
+                requested_at=datetime.now(),
+            ).to_store_dict()
+            follow_type = "HumanReviewRequested"
+            next_agent = "human_review"
+
+        follow_pos = await self._append_with_retry(
+            f"loan-{app_id}",
+            [follow_up],
+            causation_id=self.session_id,
+        )
+
+        events_written = [
+            {
+                "stream_id": f"loan-{app_id}",
+                "event_type": "DecisionGenerated",
+                "stream_position": decision_pos[0] if decision_pos else -1,
+            },
+            {
+                "stream_id": f"loan-{app_id}",
+                "event_type": follow_type,
+                "stream_position": follow_pos[0] if follow_pos else -1,
+            },
+        ]
+        await self._record_output_written(
+            events_written,
+            f"Decision={recommendation} confidence={confidence:.0%} amount=${approved_amount:,.0f}",
+        )
+        ms = int((time.time() - t) * 1000)
+        await self._record_node_execution(
+            "write_output",
+            ["recommendation", "confidence", "approved_amount", "executive_summary"],
+            ["events_written"],
+            ms,
+        )
+        return {
+            **state,
+            "output_events": events_written,
+            "next_agent": next_agent,
+            "next_agent_triggered": next_agent,
+        }

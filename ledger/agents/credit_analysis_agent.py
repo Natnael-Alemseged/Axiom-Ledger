@@ -34,7 +34,9 @@ WHEN THIS WORKS:
     → FraudScreeningRequested event on loan stream
 """
 from __future__ import annotations
+import asyncio
 from dataclasses import asdict, is_dataclass
+from typing import ClassVar
 import json
 import logging
 import time
@@ -88,6 +90,10 @@ class CreditState(TypedDict):
 # ─── AGENT ────────────────────────────────────────────────────────────────────
 
 class CreditAnalysisAgent(BaseApexAgent):
+    # Serialize credit runs per application so concurrent asyncio tasks cannot emit duplicate
+    # CreditAnalysisCompleted (NARR-01 gate).
+    _credit_locks: ClassVar[dict[str, asyncio.Lock]] = {}
+
     def __init__(
         self,
         agent_id: str,
@@ -101,6 +107,22 @@ class CreditAnalysisAgent(BaseApexAgent):
     ):
         super().__init__(agent_id, agent_type, store, registry, client, model)
         self._applicant_id_override = applicant_id_override
+
+    async def process_application(self, application_id: str) -> None:
+        lock = CreditAnalysisAgent._credit_locks.setdefault(
+            application_id, asyncio.Lock()
+        )
+        async with lock:
+            existing = await self.store.load_stream(f"credit-{application_id}")
+            if any(
+                e.get("event_type") == "CreditAnalysisCompleted" for e in existing
+            ):
+                _LOG.info(
+                    "credit_analysis_skip_duplicate application_id=%s",
+                    application_id,
+                )
+                return
+            await super().process_application(application_id)
 
     def build_graph(self) -> Any:
         from typing import Any
