@@ -268,4 +268,13 @@ pytest tests/test_mcp.py -v
 To align with the Week 5 challenge deliverable paths:
 
 - `src/schema.sql` is the canonical event-store SQL contract.
-- `src/event_store.py` mirrors the expected file path and re-exports from `ledger/event_store.py`.
+- `src/event_store.py` is the canonical async EventStore implementation.
+- `ledger/event_store.py` is a compatibility bridge importing from `src/event_store.py`.
+- `src/models/events.py` contains typed event envelopes, stream metadata, and domain exceptions.
+- `src/aggregates/` contains replay-first `LoanApplicationAggregate` and `AgentSessionAggregate`.
+- `src/commands/handlers.py` contains rubric-structured command handlers.
+- `tests/test_concurrency.py` contains the required double-decision OCC assertions.
+
+## Rubric Evidence Map
+
+For quick review, see `docs/rubric_evidence.md` for a one-page mapping from rubric criteria to concrete files and tests.
