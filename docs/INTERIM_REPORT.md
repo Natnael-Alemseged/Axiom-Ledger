@@ -92,22 +92,60 @@ The system uses **Sequence-based Synchronization**. Every write to the Event Sto
 
 **Upcaster Code:**
 ```python
-def upcast_credit_decision_v1_to_v2(event_data: dict) -> dict:
-    """Transforms a 2024 CreditDecisionMade into the 2026 schema."""
+from datetime import datetime, timezone
+
+# Deployment timeline and policy windows are immutable lookup tables.
+MODEL_VERSION_BY_DATE = [
+    (datetime(2024, 1, 1, tzinfo=timezone.utc), "credit-model-2024.1"),
+    (datetime(2025, 4, 1, tzinfo=timezone.utc), "credit-model-2025.2"),
+    (datetime(2026, 1, 1, tzinfo=timezone.utc), "credit-model-2026.1"),
+]
+
+REGULATORY_BASIS_BY_DATE = [
+    (datetime(2024, 1, 1, tzinfo=timezone.utc), "BASEL-III-2024-POLICYSET-A"),
+    (datetime(2025, 7, 1, tzinfo=timezone.utc), "BASEL-III-2025-POLICYSET-B"),
+    (datetime(2026, 1, 1, tzinfo=timezone.utc), "BASEL-IV-2026-POLICYSET-C"),
+]
+
+
+def infer_model_version(recorded_at: datetime) -> str:
+    selected = MODEL_VERSION_BY_DATE[0][1]
+    for effective_at, model_version in MODEL_VERSION_BY_DATE:
+        if recorded_at >= effective_at:
+            selected = model_version
+        else:
+            break
+    return selected
+
+
+def infer_regulatory_basis(recorded_at: datetime) -> str:
+    selected = REGULATORY_BASIS_BY_DATE[0][1]
+    for effective_at, regulatory_basis in REGULATORY_BASIS_BY_DATE:
+        if recorded_at >= effective_at:
+            selected = regulatory_basis
+        else:
+            break
+    return selected
+
+
+def upcast_credit_decision_v1_to_v2(event_data: dict, recorded_at: datetime) -> dict:
+    """Transforms CreditDecisionMade v1 into v2 without fabricating unknown data."""
     return {
         **event_data,
-        "model_version": event_data.get("model_version", "legacy-2024.1"),
-        "confidence_score": event_data.get("confidence_score", 1.0), # Assume 1.0 for historical finalized decisions
-        "regulatory_basis": event_data.get("regulatory_basis", "PRE_2026_POLICY_MANUAL"),
-        "schema_version": 2
+        "model_version": infer_model_version(recorded_at),
+        "confidence_score": None,  # Explicitly unknown for v1 events.
+        "regulatory_basis": infer_regulatory_basis(recorded_at),
+        "schema_version": 2,
     }
 ```
 
 **Inference Strategy:**
-For historical events, we use a **"Conservative Mapping"** strategy:
-- `model_version`: Assign a static "legacy" identifier that refers to the documentation/weights of the period the event was recorded.
-- `confidence_score`: We "back-fill" with a value of `1.0` if the decision was finalized, or `null` if the data cannot be recovered, ensuring the downstream projection logic knows this was a "hard" decision not based on modern probabilistic models.
-- `regulatory_basis`: We map it to the static policy document ID that was active in 2024. This maintains the audit trail's integrity by explicitly stating these decisions were made under an older regulatory framework.
+For historical events, we use a **timestamp-based deterministic inference** strategy:
+- `model_version`: Inferred from `recorded_at` by querying a deployment timeline table (or equivalent immutable lookup), not a static hard-coded legacy string.
+- `confidence_score`: Set to `null` for all v1 events because the score was never computed in the original schema. Fabricating a value (for example `1.0`) would pollute downstream analytics, bias model-performance dashboards, and misstate evidence in regulated audits.
+- `regulatory_basis`: Inferred from `recorded_at` against a policy-effective-date table so the upcast event references the rule set active at decision time.
+
+This preserves a strict distinction between **inferrable historical context** (`model_version`, `regulatory_basis`) and **genuinely unknown values** (`confidence_score = null`), while keeping the event stream immutable.
 
 ---
 
@@ -134,6 +172,7 @@ flowchart LR
     subgraph APP[Command/API Layer]
       C1[submit_application]
       C2[record_credit_analysis]
+      H[CommandHandler]
     end
 
     subgraph AGG[Aggregate Boundaries]
@@ -150,18 +189,21 @@ flowchart LR
       T4[(outbox)]
     end
 
-    C1 --> A1
-    C2 --> A1
-    C2 --> A2
+    C1 -->|command| H
+    C2 -->|command| H
+    H -->|replay -> validate -> decide| A1
+    H -->|replay -> validate -> decide| A2
+    H -->|replay -> validate -> decide| A3
+    H -->|replay -> validate -> decide| A4
 
-    A1 --> T1
-    A2 --> T1
-    A3 --> T1
-    A4 --> T1
+    A1 -->|append events| T1
+    A2 -->|append events| T1
+    A3 -->|append events| T1
+    A4 -->|append events| T1
 
-    T1 --> T2
-    T1 --> T4
-    T3 -->|daemon progress| T1
+    T1 -->|stream version update| T2
+    T1 -->|transactional write (same transaction)| T4
+    T3 -->|daemon checkpoint read/write| T1
 ```
 
 ## 3) Progress Summary (What Is Working / In Progress)
@@ -192,18 +234,53 @@ flowchart LR
 ### In Progress
 
 - **Phase 3 (Projections + Async Daemon)**
-  - Project has projection-related pieces, but full rubric-targeted Phase 3 packaging (SLO lag measurement, rebuild workflow, temporal query path) is not yet finished as a cohesive interim artifact set.
+  - Projection daemon checkpoint updates and projection-state writes are not yet consistently wrapped in one atomic boundary; this creates a crash window where replay can reprocess already-applied events.
 - **Phase 4 (Upcasting + Integrity + Gas Town)**
-  - Upcaster-related structures exist, but full required evidence set (immutability test artifact + integrity chain demonstration) is still being finalized.
+  - Upcasting implementation now matches rubric semantics, but the immutability and chain-integrity test artifacts are not yet bundled as a single reproducible evidence package in this report.
 - **Phase 5 (MCP Surface)**
-  - MCP-related components exist in repo history, but final rubric-compliant tool/resource packaging and lifecycle evidence for the Week 5 spec remains to be completed.
+  - MCP command/resource contracts exist, but lifecycle validation is not yet demonstrated end-to-end through MCP-only calls with captured request/response evidence.
 
 ## 4) Concurrency Test Results (Double-Decision Passing Log Output)
 
-Command executed:
+Commands executed:
 
 ```bash
 .venv/bin/python -m pytest tests/test_concurrency.py::test_double_decision_exactly_one_wins -q
+.venv/bin/python -m pytest tests/test_concurrency.py::test_double_decision_exactly_one_wins -q --tb=line
+.venv/bin/python - <<'PY'
+import asyncio
+from src.event_store import InMemoryEventStore
+from src.models.events import OptimisticConcurrencyError
+
+def _event(event_type: str, seq: int) -> dict:
+    return {"event_type": event_type, "event_version": 1, "payload": {"seq": seq}}
+
+async def main():
+    store = InMemoryEventStore()
+    stream_id = "loan-APEX-DOUBLE-001"
+    await store.append(stream_id, [_event("ApplicationSubmitted", 0)], expected_version=-1)
+    await store.append(stream_id, [_event("CreditAnalysisRequested", 1)], expected_version=0)
+    await store.append(stream_id, [_event("FraudScreeningCompleted", 2)], expected_version=1)
+    await store.append(stream_id, [_event("ComplianceRulePassed", 3)], expected_version=2)
+
+    async def try_append(agent_name: str):
+        return await store.append(
+            stream_id,
+            [{"event_type": "CreditAnalysisCompleted", "event_version": 2,
+              "payload": {"agent": agent_name, "recommended_limit_usd": 100000}}],
+            expected_version=3,
+        )
+
+    results = await asyncio.gather(try_append("A"), try_append("B"), return_exceptions=True)
+    success_positions = [r[0] for r in results if isinstance(r, list)]
+    failures = [r for r in results if isinstance(r, OptimisticConcurrencyError)]
+    stream = await store.load_stream(stream_id)
+    print(f"Stream length: {len(stream)}")
+    print(f"Winning task final position: {success_positions[0] if success_positions else None}")
+    print(f"Losing task raised: {type(failures[0]).__name__ if failures else None}")
+
+asyncio.run(main())
+PY
 ```
 
 Output:
@@ -211,17 +288,26 @@ Output:
 ```text
 .                                                                        [100%]
 1 passed, 48 warnings in 0.03s
+
+Stream length: 5
+Winning task final position: 4
+Losing task raised: OptimisticConcurrencyError
 ```
+
+Interpretation:
+- Baseline stream had 4 events before the concurrent write race; final length 5 confirms exactly one additional event committed.
+- Winner append returned stream position 4.
+- Loser path surfaced `OptimisticConcurrencyError` and was not silently swallowed.
 
 ## 5) Known Gaps and Plan for Final Submission
 
 ### Known Gaps
 
-- Projection daemon and projection SLO evidence need to be consolidated to match final deliverable checks.
-- Temporal compliance query interface and snapshot strategy evidence need explicit test artifacts.
-- Upcasting immutability and cryptographic integrity chain evidence need final test/demo outputs.
-- End-to-end MCP lifecycle test and resource query contract need full final packaging.
-- Final PDF/report artifacts (architecture figure export, command output screenshots, what-if/bonus evidence if attempted) are not yet assembled into final form.
+- Projection daemon checkpointing still has a crash-window risk when checkpoint advancement is not committed atomically with projection-state mutation.
+- Temporal compliance query and snapshot evidence are incomplete because `as_of` validation cases are not yet captured in dedicated reproducible test runs.
+- Upcasting immutability and cryptographic integrity-chain evidence exist as partial components, but not yet as one stitched artifact set with raw-output logs and verification assertions.
+- MCP lifecycle proof is missing a strict MCP-only happy-path/failure-path transcript that demonstrates command handling and resource reads without internal shortcuts.
+- Final packaging gap is operational: architecture PNG export + consolidated terminal evidence blocks are not yet assembled into the final submission bundle.
 
 ### Plan (Toward Final Submission)
 
