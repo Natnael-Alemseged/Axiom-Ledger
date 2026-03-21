@@ -1,0 +1,36 @@
+flowchart LR
+    subgraph APP[Command/API Layer]
+      C1[submit_application]
+      C2[record_credit_analysis]
+      H[CommandHandler]
+    end
+
+    subgraph AGG[Aggregate Boundaries]
+      A1[LoanApplication\nstream: loan-{application_id}]
+      A2[AgentSession\nstream: agent-{agent_id}-{session_id}]
+      A3[ComplianceRecord\nstream: compliance-{application_id}]
+      A4[AuditLedger\nstream: audit-{entity}-{id}]
+    end
+
+    subgraph DB[PostgreSQL Event Store]
+      T1[(events)]
+      T2[(event_streams)]
+      T3[(projection_checkpoints)]
+      T4[(outbox)]
+    end
+
+    C1 -->|command| H
+    C2 -->|command| H
+    H -->|replay -> validate -> decide| A1
+    H -->|replay -> validate -> decide| A2
+    H -->|replay -> validate -> decide| A3
+    H -->|replay -> validate -> decide| A4
+
+    A1 -->|append events| T1
+    A2 -->|append events| T1
+    A3 -->|append events| T1
+    A4 -->|append events| T1
+
+    T1 -->|stream version update| T2
+    T1 -->|transactional write (same transaction)| T4
+    T3 -->|daemon checkpoint read/write| T1
