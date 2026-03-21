@@ -37,6 +37,9 @@ async def test_double_decision_exactly_one_wins():
             expected_version=3,
         )
 
+    before_stream = await store.load_stream(stream_id)
+    before_len = len(before_stream)
+
     results = await asyncio.gather(
         try_append("A"),
         try_append("B"),
@@ -47,7 +50,14 @@ async def test_double_decision_exactly_one_wins():
     failures = [r for r in results if isinstance(r, OptimisticConcurrencyError)]
 
     stream = await store.load_stream(stream_id)
+    winner_events = [
+        e for e in stream if e["event_type"] == "CreditAnalysisCompleted" and e["stream_position"] == 4
+    ]
 
-    assert len(stream) == 5
+    # Required concurrency guarantees under contention:
+    # 1) exactly one additional event was appended
+    # 2) the winner occupies the expected stream position
+    assert len(stream) == before_len + 1
     assert success_positions == [4]
     assert len(failures) == 1
+    assert len(winner_events) == 1
