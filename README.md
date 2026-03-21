@@ -20,16 +20,19 @@ docker run -d -e POSTGRES_PASSWORD=apex -e POSTGRES_DB=apex_ledger -p 5432:5432 
 cp .env.example .env
 # Edit .env — e.g. OPENROUTER_API_KEY (sk-or-v1-...) or a Google AI Studio key for direct Gemini
 
-# 4. Generate all data (companies + documents + seed events → DB)
+# 4. Apply canonical event-store schema (submission contract)
+psql postgresql://postgres:apex@localhost/apex_ledger -f src/schema.sql
+
+# 5. Generate all data (companies + documents + seed events → DB)
 python datagen/generate_all.py --db-url postgresql://postgres:apex@localhost/apex_ledger
 
-# 5. Validate schema (no DB needed)
+# 6. Validate schema (no DB needed)
 python datagen/generate_all.py --skip-db --skip-docs --validate-only
 
-# 6. Schema & generator tests
+# 7. Schema & generator tests
 pytest tests/test_schema_and_generator.py -v
 
-# 7. Event store (implement in ledger/event_store.py), then:
+# 8. Event store (implement in ledger/event_store.py), then:
 # pytest tests/test_event_store.py -v
 ```
 
@@ -259,3 +262,10 @@ pytest tests/test_narratives.py -v
 pytest tests/test_projections.py -v
 pytest tests/test_mcp.py -v
 ```
+
+## Submission Structure
+
+To align with the Week 5 challenge deliverable paths:
+
+- `src/schema.sql` is the canonical event-store SQL contract.
+- `src/event_store.py` mirrors the expected file path and re-exports from `ledger/event_store.py`.
