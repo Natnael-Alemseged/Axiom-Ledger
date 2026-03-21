@@ -20,17 +20,17 @@ If redesigned with The Ledger, the architecture would shift such that the **even
 **Question:** In the scenario below, you will build four aggregates. Identify one alternative boundary you considered and rejected. What coupling problem does your chosen boundary prevent?
 
 **Answer:**
-The four aggregates identified for this domain are:
-1. `LoanApplication`: Encapsulates the workflow state machine (Submitted → Underwriting → Decision).
-2. `ApplicantIdentity`: Manages KYC, personal data, and verification status.
-3. `CreditAssessment`: Manages specific calculations, bureau data, and risk model versions.
-4. `DisbursementAccount`: Manages the financial ledger of funds released and repayments made.
+The four aggregates for this scenario are:
+1. `LoanApplication`: Lifecycle state machine from submission through human-reviewed final decision.
+2. `AgentSession`: Per-agent execution trace (context load, model version, inputs, and outputs).
+3. `ComplianceRecord`: Regulation checks and rule-level pass/fail evidence for an application.
+4. `AuditLedger`: Cross-stream integrity and causal trace for a business entity.
 
 **Alternative Boundary Considered & Rejected:**
-I considered merging `CreditAssessment` directly into `LoanApplication`.
+I considered merging `ComplianceRecord` into `LoanApplication`.
 
 **Reason for Rejection & Coupling Prevention:**
-I rejected this because credit data (like a bureau report) has a different lifecycle and reuse potential than a specific loan application. A credit report might be valid for 90 days and used for multiple applications. By keeping them separate, we prevent **transactional coupling**. Specifically, it prevents the `LoanApplication` aggregate from becoming a "God Object" where every minor update to a credit model or a new piece of bureau data requires a write-lock on the entire application process. This separation ensures that the underwriting agent can work on credit analysis without blocking the compliance agent from running identity checks.
+I rejected this because compliance evidence evolves at a different cadence than loan decisioning and can be updated independently (new regulation set versions, remediation checks, re-runs). Keeping `ComplianceRecord` separate prevents **write-hot coupling** on `loan-{application_id}` streams during concurrent agent execution. Without this boundary, compliance rule updates and decision-state transitions would contend for the same expected version window, increasing OptimisticConcurrencyError rates and creating avoidable retries during high-throughput periods.
 
 ---
 
