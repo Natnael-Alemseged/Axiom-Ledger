@@ -185,6 +185,9 @@ flowchart LR
   - `tests/test_concurrency.py` passes (double-decision OCC case).
   - `tests/test_rubric_core.py` passes.
   - Existing regressions like `tests/test_schema_and_generator.py` and narrative terminal-state gate continue to pass.
+- **Packaging/Dependency Locking**
+  - Root `pyproject.toml` now exists for the main repo.
+  - `uv.lock` has been generated from the root project definition to satisfy locked dependency deliverable requirements.
 
 ### In Progress
 
