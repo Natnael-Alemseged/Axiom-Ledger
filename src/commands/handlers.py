@@ -68,10 +68,12 @@ async def handle_fraud_screening_completed(
         },
     }
 
+    fraud_stream = f"fraud-{application_id}"
+    fraud_version = await store.stream_version(fraud_stream)
     await store.append(
-        stream_id=f"loan-{application_id}",
+        stream_id=fraud_stream,
         events=[event],
-        expected_version=app.current_version,
+        expected_version=fraud_version,
         correlation_id=correlation_id,
         causation_id=causation_id,
     )
@@ -236,9 +238,10 @@ async def handle_start_agent_session(
         "payload": {
             "agent_id": agent_id,
             "session_id": session_id,
+            "application_id": cmd.get("application_id", ""),
             "context_source": cmd["context_source"],
             "event_replay_from_position": cmd.get("event_replay_from_position", 0),
-            "context_token_count": cmd["context_token_count"],
+            "context_token_count": cmd.get("context_token_count", 0),
             "model_version": cmd["model_version"],
         },
     }
