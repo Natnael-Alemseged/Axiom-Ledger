@@ -288,7 +288,6 @@ def register_tools(mcp: FastMCP, store_factory) -> None:
             agent = await AgentSessionAggregate.load(store, agent_id, session_id)
             agent.assert_context_loaded()
 
-            version = await store.stream_version(f"loan-{application_id}")
             event = {
                 "event_type": "FraudScreeningCompleted",
                 "event_version": 1,
