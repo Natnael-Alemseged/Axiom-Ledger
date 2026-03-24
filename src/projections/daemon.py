@@ -17,6 +17,8 @@ class ProjectionDaemon:
         self._checkpoints: dict[str, int] = {}
         self._error_counts: dict[str, int] = {}
         self._max_retries: int = 3
+        # Tracks the wall-clock time (ms) of the most recently processed event per projection
+        self._last_event_time_ms: dict[str, float] = {}
 
     async def run_forever(self, poll_interval_ms: int = 100) -> None:
         self._running = True
@@ -67,6 +69,16 @@ class ProjectionDaemon:
                 try:
                     await projection.handle(event)
                     self._error_counts.pop(err_key, None)
+                    # Track when this event was recorded for real lag measurement
+                    recorded_at = event.get("recorded_at")
+                    if recorded_at:
+                        try:
+                            ts = datetime.fromisoformat(str(recorded_at))
+                            if ts.tzinfo is None:
+                                ts = ts.replace(tzinfo=timezone.utc)
+                            self._last_event_time_ms[name] = ts.timestamp() * 1000
+                        except (ValueError, TypeError):
+                            pass
                 except Exception as e:
                     self._error_counts[err_key] = self._error_counts.get(err_key, 0) + 1
                     logger.warning(
@@ -83,9 +95,10 @@ class ProjectionDaemon:
                 await self._store.save_checkpoint(name, last_global_pos + 1)
                 self._checkpoints[name] = last_global_pos + 1
 
-        # Update lag (simplified: 0ms for in-memory store)
+        # Compute real lag: wall-clock time since the last event each projection processed
         now_ms = datetime.now(timezone.utc).timestamp() * 1000
         for name in self._projections:
-            self._lag_ms[name] = 0.0  # Real impl would track event.recorded_at vs now
+            last_ts = self._last_event_time_ms.get(name)
+            self._lag_ms[name] = now_ms - last_ts if last_ts is not None else 0.0
 
         return events_processed
