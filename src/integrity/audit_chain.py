@@ -1,10 +1,10 @@
 from __future__ import annotations
+
 import hashlib
 import json
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Any
-from uuid import uuid4
 
 
 @dataclass
@@ -21,7 +21,7 @@ class IntegrityCheckResult:
 
 
 def _hash_event(event: dict) -> str:
-    """Deterministic SHA-256 hash of an event's payload."""
+    """Deterministic SHA-256 hash of a stored event's identity fields + payload."""
     canonical = json.dumps(
         {
             "event_id": str(event.get("event_id", "")),
@@ -37,7 +37,7 @@ def _hash_event(event: dict) -> str:
 
 
 def _compute_chain_hash(previous_hash: str | None, event_hashes: list[str]) -> str:
-    """Compute new integrity hash: SHA-256(previous_hash + sorted event hashes)."""
+    """Compute integrity hash: SHA-256(previous_hash | event_hash_1 | ... | event_hash_n)."""
     data = (previous_hash or "GENESIS") + "|".join(event_hashes)
     return hashlib.sha256(data.encode()).hexdigest()
 
@@ -48,12 +48,17 @@ async def run_integrity_check(
     entity_id: str,
 ) -> IntegrityCheckResult:
     """
-    1. Load all events for the entity's primary stream.
-    2. Load the last AuditIntegrityCheckRun event (if any).
-    3. Hash payloads of all events since the last check.
-    4. Verify hash chain: new_hash = sha256(previous_hash + event_hashes).
-    5. Append new AuditIntegrityCheckRun event to audit-{entity_type}-{entity_id} stream.
-    6. Return result.
+    Cryptographic audit chain integrity check.
+
+    Algorithm:
+    1. Load all events from the primary stream.
+    2. Find the last AuditIntegrityCheckRun event (if any).
+    3. TAMPER DETECTION: Re-hash the events that were verified in the last check
+       and compare the computed hash to the stored integrity_hash.
+       A mismatch means stored events were altered after being verified.
+    4. Hash the new events (since the last check) against the previous hash.
+    5. Append a new AuditIntegrityCheckRun event to the audit stream.
+    6. Return IntegrityCheckResult with chain_valid and tamper_detected flags.
     """
     primary_stream = f"loan-{entity_id}" if entity_type == "loan" else f"{entity_type}-{entity_id}"
     audit_stream = f"audit-{entity_type}-{entity_id}"
@@ -61,7 +66,7 @@ async def run_integrity_check(
     # Load primary stream events
     primary_events = await store.load_stream(primary_stream)
 
-    # Load audit stream to find last integrity check
+    # Load audit stream to find the last integrity check record
     try:
         audit_events = await store.load_stream(audit_stream)
     except Exception:
@@ -73,35 +78,43 @@ async def run_integrity_check(
             last_check = ae
             break
 
-    previous_hash = None
-    events_since_last_check = primary_events
-
-    if last_check:
-        previous_hash = last_check["payload"].get("integrity_hash")
-        last_check_position = last_check["payload"].get("stream_position", 0)
-        events_since_last_check = [
-            e for e in primary_events
-            if int(e.get("stream_position", 0)) > last_check_position
-        ]
-
-    # Hash all events
-    event_hashes = [_hash_event(e) for e in events_since_last_check]
-    new_hash = _compute_chain_hash(previous_hash, event_hashes)
-
-    # Verify chain integrity
+    # ── Tamper detection ────────────────────────────────────────────────────
     chain_valid = True
     tamper_detected = False
+    previous_hash: str | None = None
+    events_to_verify: list[dict] = primary_events  # default: verify all events
 
     if last_check:
-        # Re-verify the previous hash matches what we compute
-        # If events between 0 and last_check_position produce a different hash → tamper
-        stored_prev = last_check["payload"].get("previous_hash")
-        if stored_prev is not None:
-            # We can't re-verify without knowing the events before that check
-            # This is a simplified verification — in production you'd walk the full chain
-            chain_valid = True
+        stored_integrity_hash = last_check["payload"].get("integrity_hash")
+        stored_previous_hash = last_check["payload"].get("previous_hash")
+        # Cumulative count of events covered by the last check run
+        last_verified_count: int = int(last_check["payload"].get("last_verified_count", 0))
 
-    # Append AuditIntegrityCheckRun event to audit stream
+        # Re-hash exactly the events that were present when the last check ran.
+        # If anything in that segment was altered, the hash will differ.
+        events_in_last_segment = primary_events[:last_verified_count]
+        if events_in_last_segment:
+            rehashed = [_hash_event(e) for e in events_in_last_segment]
+            recomputed = _compute_chain_hash(stored_previous_hash, rehashed)
+            if recomputed != stored_integrity_hash:
+                # Hash mismatch: events before the last checkpoint were tampered with
+                chain_valid = False
+                tamper_detected = True
+
+        # Carry the verified hash forward as the starting point for new events
+        previous_hash = stored_integrity_hash
+        events_to_verify = primary_events[last_verified_count:]
+
+    # ── Hash new events ─────────────────────────────────────────────────────
+    event_hashes = [_hash_event(e) for e in events_to_verify]
+    new_hash = _compute_chain_hash(previous_hash, event_hashes)
+
+    # Cumulative events now covered by this check (used for next re-verify)
+    cumulative_count = (
+        int(last_check["payload"].get("last_verified_count", 0)) if last_check else 0
+    ) + len(events_to_verify)
+
+    # ── Append AuditIntegrityCheckRun event ─────────────────────────────────
     try:
         audit_version = await store.stream_version(audit_stream)
         audit_event = {
@@ -111,7 +124,8 @@ async def run_integrity_check(
                 "entity_type": entity_type,
                 "entity_id": entity_id,
                 "check_timestamp": datetime.now(timezone.utc).isoformat(),
-                "events_verified_count": len(events_since_last_check),
+                "events_verified_count": len(events_to_verify),
+                "last_verified_count": cumulative_count,
                 "integrity_hash": new_hash,
                 "previous_hash": previous_hash,
                 "chain_valid": chain_valid,
@@ -127,9 +141,9 @@ async def run_integrity_check(
         return IntegrityCheckResult(
             entity_type=entity_type,
             entity_id=entity_id,
-            events_verified=len(events_since_last_check),
+            events_verified=len(events_to_verify),
             chain_valid=False,
-            tamper_detected=False,
+            tamper_detected=tamper_detected,
             integrity_hash=new_hash,
             previous_hash=previous_hash,
             error_message=str(e),
@@ -138,7 +152,7 @@ async def run_integrity_check(
     return IntegrityCheckResult(
         entity_type=entity_type,
         entity_id=entity_id,
-        events_verified=len(events_since_last_check),
+        events_verified=len(events_to_verify),
         chain_valid=chain_valid,
         tamper_detected=tamper_detected,
         integrity_hash=new_hash,
