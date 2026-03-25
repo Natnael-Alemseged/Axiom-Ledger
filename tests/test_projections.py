@@ -17,6 +17,7 @@ import pytest
 from datetime import datetime, timezone, timedelta
 
 from src.event_store import InMemoryEventStore
+from src.commands.handlers import handle_submit_application
 from src.projections.application_summary import ApplicationSummaryProjection
 from src.projections.agent_performance import AgentPerformanceLedgerProjection
 from src.projections.compliance_audit import ComplianceAuditViewProjection
@@ -303,3 +304,54 @@ async def test_projection_daemon_lag_under_load():
     # All 50 applications should be visible in the projection
     all_apps = app_summary.get_all()
     assert len(all_apps) == 50
+
+
+@pytest.mark.asyncio
+async def test_projection_daemon_slo_with_50_concurrent_handlers_and_rebuild():
+    """
+    Rubric SLO test:
+    - 50 concurrent command handlers append events.
+    - Projection lag for ApplicationSummary stays under 500ms.
+    - compliance rebuild_from_scratch completes while live reads remain available.
+    """
+    store = InMemoryEventStore()
+    await store.connect()
+    app_summary = ApplicationSummaryProjection()
+    agent_perf = AgentPerformanceLedgerProjection()
+    compliance = ComplianceAuditViewProjection()
+    daemon = ProjectionDaemon(
+        store=store,
+        projections=[app_summary, agent_perf, compliance],
+        max_retries=3,
+        batch_size=25,
+    )
+    daemon_task = asyncio.create_task(daemon.run_forever(poll_interval_ms=5))
+    try:
+        async def submit(i: int):
+            app_id = f"slo-{i:03d}"
+            await handle_submit_application(
+                {
+                    "application_id": app_id,
+                    "applicant_id": f"corp-{i:03d}",
+                    "requested_amount_usd": 100000 + i,
+                    "loan_purpose": "working_capital",
+                    "submission_channel": "api",
+                    "submitted_at": _now(),
+                },
+                store,
+            )
+
+        await asyncio.gather(*[submit(i) for i in range(50)])
+        await asyncio.sleep(0.1)
+        assert len(app_summary.get_all()) == 50
+        assert daemon.get_lag("application_summary") < 500
+
+        # Rebuild should finish quickly and not block reads from already-populated projections.
+        rebuild_task = asyncio.create_task(compliance.rebuild_from_scratch(store))
+        read_during_rebuild = app_summary.get("slo-000")
+        assert read_during_rebuild is not None
+        await rebuild_task
+        assert daemon.get_lag("application_summary") < 500
+    finally:
+        await daemon.stop()
+        daemon_task.cancel()

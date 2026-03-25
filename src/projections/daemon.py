@@ -9,7 +9,13 @@ logger = logging.getLogger(__name__)
 class ProjectionDaemon:
     """Async daemon that polls the event store and routes events to projections."""
 
-    def __init__(self, store, projections: list, max_retries: int = 3):
+    def __init__(
+        self,
+        store,
+        projections: list,
+        max_retries: int = 3,
+        batch_size: int = 200,
+    ):
         self._store = store
         self._projections = {p.name: p for p in projections}
         self._running = False
@@ -17,6 +23,7 @@ class ProjectionDaemon:
         self._checkpoints: dict[str, int] = {}
         self._error_counts: dict[str, int] = {}
         self._max_retries: int = max_retries
+        self._batch_size: int = max(1, int(batch_size))
         # Tracks the wall-clock time (ms) of the most recently processed event per projection
         self._last_event_time_ms: dict[str, float] = {}
 
@@ -56,15 +63,48 @@ class ProjectionDaemon:
             min_pos = 0
 
         events_processed = 0
-        last_global_pos = int(min_pos)
+        batch_events: list[dict[str, Any]] = []
+        last_global_pos = int(min_pos) - 1
 
-        async for event in self._store.load_all(from_global_position=int(min_pos)):
+        async for event in self._store.load_all(
+            from_global_position=int(min_pos),
+            batch_size=self._batch_size,
+        ):
+            batch_events.append(event)
+            if len(batch_events) < self._batch_size:
+                continue
+            processed, last_global_pos = await self._process_events_batch(batch_events)
+            events_processed += processed
+            batch_events = []
+
+        if batch_events:
+            processed, last_global_pos = await self._process_events_batch(batch_events)
+            events_processed += processed
+
+        # Compute real lag: wall-clock time since the last event each projection processed
+        now_ms = datetime.now(timezone.utc).timestamp() * 1000
+        for name in self._projections:
+            last_ts = self._last_event_time_ms.get(name)
+            self._lag_ms[name] = now_ms - last_ts if last_ts is not None else 0.0
+
+        return events_processed
+
+    async def _process_events_batch(self, events: list[dict[str, Any]]) -> tuple[int, int]:
+        events_processed = 0
+        last_global_pos = -1
+        for event in events:
             gpos = int(event.get("global_position", 0))
             for name, projection in self._projections.items():
                 if self._checkpoints.get(name, 0) > gpos:
                     continue  # this projection is ahead, skip
                 err_key = f"{name}:{gpos}"
                 if self._error_counts.get(err_key, 0) >= self._max_retries:
+                    logger.error(
+                        "Projection %s permanently skipped event %s after %d retries",
+                        name,
+                        gpos,
+                        self._max_retries,
+                    )
                     continue  # skip permanently failed events
                 try:
                     await projection.handle(event)
@@ -94,11 +134,4 @@ class ProjectionDaemon:
             for name in self._projections:
                 await self._store.save_checkpoint(name, last_global_pos + 1)
                 self._checkpoints[name] = last_global_pos + 1
-
-        # Compute real lag: wall-clock time since the last event each projection processed
-        now_ms = datetime.now(timezone.utc).timestamp() * 1000
-        for name in self._projections:
-            last_ts = self._last_event_time_ms.get(name)
-            self._lag_ms[name] = now_ms - last_ts if last_ts is not None else 0.0
-
-        return events_processed
+        return events_processed, last_global_pos
