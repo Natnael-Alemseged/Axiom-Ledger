@@ -15,6 +15,7 @@ class LoanApplicationAggregate:
     compliance_pending: bool = True
     agent_assessed_max_limit: float | None = None
     approved_limit: float | None = None
+    known_agent_sessions: set[str] = field(default_factory=set)
     _handlers: dict[str, Callable[[dict], None]] = field(init=False, repr=False, default_factory=dict)
 
     def __post_init__(self) -> None:
@@ -80,6 +81,26 @@ class LoanApplicationAggregate:
                 f"Application must have completed credit analysis first."
             )
 
+    def assert_causal_chain(self, contributing_agent_sessions: list[str]) -> None:
+        """
+        Business rule: each decision must declare causal provenance.
+        """
+        if not contributing_agent_sessions:
+            raise DomainError(
+                "Decision must include at least one contributing_agent_sessions entry"
+            )
+
+    def assert_approval_dependencies(
+        self,
+        recommendation: str,
+        compliance_ready: bool,
+    ) -> None:
+        """
+        Business rule: approvals require successful compliance checks.
+        """
+        if recommendation == "APPROVE" and not compliance_ready:
+            raise DomainError("Cannot approve before mandatory compliance checks pass")
+
     def _apply_application_submitted(self, _: dict) -> None:
         self._transition("Submitted")
         self.state = "AwaitingAnalysis"
@@ -87,6 +108,9 @@ class LoanApplicationAggregate:
     def _apply_credit_analysis_completed(self, event: dict) -> None:
         payload = event["payload"]
         self.agent_assessed_max_limit = float(payload["recommended_limit_usd"])
+        session_id = payload.get("session_id")
+        if session_id:
+            self.known_agent_sessions.add(session_id)
         self._transition("AnalysisComplete")
 
     def _apply_compliance_check_requested(self, _: dict) -> None:

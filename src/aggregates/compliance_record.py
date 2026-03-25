@@ -13,9 +13,9 @@ class ComplianceRecordAggregate:
     application_id: str
     current_version: int = -1
     regulation_set_version: str | None = None
-    rules_evaluated: set = field(default_factory=set)
-    rules_passed: set = field(default_factory=set)
-    rules_failed: set = field(default_factory=set)
+    rules_evaluated: set[str] = field(default_factory=set)
+    rules_passed: set[str] = field(default_factory=set)
+    rules_failed: set[str] = field(default_factory=set)
     mandatory_checks_passed: bool = False
     has_hard_block: bool = False
     _handlers: dict[str, Callable[[dict], None]] = field(init=False, repr=False, default_factory=dict)
@@ -53,6 +53,14 @@ class ComplianceRecordAggregate:
             raise DomainError(
                 f"Compliance hard block exists due to failed rules: {self.rules_failed}"
             )
+
+    def assert_approval_preconditions(self) -> None:
+        """
+        Business rule: an application cannot be approved until mandatory checks pass
+        and no hard-blocking compliance failures remain.
+        """
+        self.assert_all_mandatory_checks_complete()
+        self.assert_no_hard_block()
 
     def _apply_compliance_check_requested(self, event: dict) -> None:
         payload = event["payload"]
