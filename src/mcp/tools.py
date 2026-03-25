@@ -431,14 +431,19 @@ def register_tools(mcp: FastMCP, store_factory) -> None:
         approved_amount_usd: float | None = None,
     ) -> dict:
         store = store_factory()
-        from src.models.events import OptimisticConcurrencyError
-
-        # Confidence floor enforcement (regulatory requirement)
-        if confidence_score < 0.6:
-            recommendation = "REFER"
+        from src.aggregates.loan_application import LoanApplicationAggregate
+        from src.models.events import DomainError, OptimisticConcurrencyError
 
         try:
-            version = await store.stream_version(f"loan-{application_id}")
+            # Load aggregate — enforces load→validate→determine→append pattern
+            app = await LoanApplicationAggregate.load(store, application_id)
+            app.assert_can_generate_decision()
+
+            # Confidence floor: enforced inside aggregate logic (not API layer)
+            recommendation, floor_applied = app.enforce_confidence_floor(
+                recommendation, confidence_score
+            )
+
             event = {
                 "event_type": "DecisionGenerated",
                 "event_version": 2,
@@ -457,13 +462,18 @@ def register_tools(mcp: FastMCP, store_factory) -> None:
             await store.append(
                 stream_id=f"loan-{application_id}",
                 events=[event],
-                expected_version=version,
+                expected_version=app.current_version,
             )
             return _ok(
                 decision_id=f"dec-{application_id}",
                 recommendation=recommendation,
                 confidence_score=confidence_score,
-                confidence_floor_applied=confidence_score < 0.6,
+                confidence_floor_applied=floor_applied,
+            )
+        except DomainError as e:
+            return _error(
+                "PreconditionFailed", str(e),
+                "Ensure credit analysis is complete before generating decision",
             )
         except OptimisticConcurrencyError as e:
             return _error(
