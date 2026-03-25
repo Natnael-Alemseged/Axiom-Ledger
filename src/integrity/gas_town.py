@@ -123,27 +123,41 @@ async def reconstruct_agent_context(
     if "AgentSessionFailed" in event_types_seen and "AgentSessionRecovered" not in event_types_seen:
         health_status = SessionHealthStatus.FAILED
 
+    import json
+
     # Build context text with token budget awareness
     last_3 = events[-3:]
     older_events = events[:-3] if len(events) > 3 else []
 
-    # Summarise older events into prose
+    # Event types that must be preserved verbatim even when older than last 3
+    _VERBATIM_PRESERVE_TYPES = _PARTIAL_EVENT_TYPES | {"AgentToolCalled"}
+
+    # Summarise older events into prose; preserve PENDING/ERROR events verbatim
     summary_lines = []
+    verbatim_preserved_lines: list[str] = []
     if older_events:
         summary_lines.append(f"Session summary ({len(older_events)} prior events):")
         for e in older_events:
             et = e["event_type"]
             p = e.get("payload", {})
             pos = e.get("stream_position", "?")
-            line = f"  [{pos}] {et}"
-            if "application_id" in p:
-                line += f" for app {p['application_id']}"
-            summary_lines.append(line)
+            if et in _VERBATIM_PRESERVE_TYPES:
+                # Preserve PENDING/ERROR events verbatim regardless of age
+                verbatim_preserved_lines.append(
+                    f"  [{pos}] {et} [PRESERVED]: {json.dumps(p, default=str)[:200]}"
+                )
+            else:
+                line = f"  [{pos}] {et}"
+                if "application_id" in p:
+                    line += f" for app {p['application_id']}"
+                summary_lines.append(line)
 
     # Verbatim last 3 events
     verbatim_lines = ["\nRecent events (verbatim):"]
+    if verbatim_preserved_lines:
+        verbatim_lines.append("\nPreserved PENDING/ERROR events (verbatim):")
+        verbatim_lines.extend(verbatim_preserved_lines)
     for e in last_3:
-        import json
         verbatim_lines.append(f"  [{e.get('stream_position')}] {e['event_type']}: {json.dumps(e.get('payload', {}), default=str)[:200]}")
 
     if pending_work:
