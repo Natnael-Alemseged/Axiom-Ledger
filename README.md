@@ -170,7 +170,7 @@ PYTEST_LLM=openrouter .venv/bin/python -m pytest tests/test_narratives.py::test_
 .venv/bin/python -m pytest tests/test_narratives.py::test_deliverable_five_terminal_states -v
 ```
 
-**PostgreSQL** (after `datagen/generate_all.py` with `--db-url`): example queries are in `docs/verification_queries.sql` (decision counts, `ApplicationApproved` / `ApplicationDeclined`, compliance hard blocks).
+**PostgreSQL** (after `datagen/generate_all.py` with `--db-url`): example queries are in `sql/verification_queries.sql` (decision counts, `ApplicationApproved` / `ApplicationDeclined`, compliance hard blocks).
 
 ### End-to-end smoke test: `DocumentProcessingAgent` (inline)
 
@@ -275,6 +275,6 @@ To align with the Week 5 challenge deliverable paths:
 - `src/commands/handlers.py` contains rubric-structured command handlers.
 - `tests/test_concurrency.py` contains the required double-decision OCC assertions.
 
-## Rubric Evidence Map
+## Rubric evidence
 
-For quick review, see `docs/rubric_evidence.md` for a one-page mapping from rubric criteria to concrete files and tests.
+See **Submission Structure** above for canonical paths (`src/…`, `tests/…`). Grading maps to those files and the tests listed in this README.
