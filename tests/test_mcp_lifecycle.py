@@ -94,13 +94,14 @@ async def test_full_mcp_loan_lifecycle(mcp_setup):
     """
     mcp, store, projections, daemon = mcp_setup
     await store.connect()
+    daemon_task = asyncio.create_task(daemon.run_forever(poll_interval_ms=10))
+    try:
+        application_id = "mcp-lifecycle-001"
+        agent_id = "credit-agent-01"
+        session_id = "sess-mcp-001"
 
-    application_id = "mcp-lifecycle-001"
-    agent_id = "credit-agent-01"
-    session_id = "sess-mcp-001"
-
-    # ── Step 1: Start agent session (Gas Town anchor) ──────────────────────
-    result = await mcp.call_tool(
+        # ── Step 1: Start agent session (Gas Town anchor) ──────────────────────
+        result = await mcp.call_tool(
         "start_agent_session",
         agent_id=agent_id,
         session_id=session_id,
@@ -109,11 +110,11 @@ async def test_full_mcp_loan_lifecycle(mcp_setup):
         context_source="fresh_start",
         context_token_count=500,
     )
-    assert result["success"], f"start_agent_session failed: {result}"
-    assert result["session_id"] == session_id
+        assert result["success"], f"start_agent_session failed: {result}"
+        assert result["session_id"] == session_id
 
-    # ── Step 2: Submit application ─────────────────────────────────────────
-    result = await mcp.call_tool(
+        # ── Step 2: Submit application ─────────────────────────────────────────
+        result = await mcp.call_tool(
         "submit_application",
         application_id=application_id,
         applicant_id="apex-financial-client",
@@ -121,11 +122,11 @@ async def test_full_mcp_loan_lifecycle(mcp_setup):
         loan_purpose="working_capital",
         submission_channel="online_portal",
     )
-    assert result["success"], f"submit_application failed: {result}"
-    assert result["stream_id"] == f"loan-{application_id}"
+        assert result["success"], f"submit_application failed: {result}"
+        assert result["stream_id"] == f"loan-{application_id}"
 
-    # ── Step 3: Record credit analysis ─────────────────────────────────────
-    result = await mcp.call_tool(
+        # ── Step 3: Record credit analysis ─────────────────────────────────────
+        result = await mcp.call_tool(
         "record_credit_analysis",
         application_id=application_id,
         agent_id=agent_id,
@@ -137,12 +138,12 @@ async def test_full_mcp_loan_lifecycle(mcp_setup):
         analysis_duration_ms=1500,
         input_data_hash="sha256:abc123def456",
     )
-    assert result["success"], f"record_credit_analysis failed: {result}"
+        assert result["success"], f"record_credit_analysis failed: {result}"
 
-    # ── Step 4: Record fraud screening ─────────────────────────────────────
-    fraud_agent_id = "fraud-agent-01"
-    fraud_session_id = "sess-fraud-001"
-    await mcp.call_tool(
+        # ── Step 4: Record fraud screening ─────────────────────────────────────
+        fraud_agent_id = "fraud-agent-01"
+        fraud_session_id = "sess-fraud-001"
+        fraud_start = await mcp.call_tool(
         "start_agent_session",
         agent_id=fraud_agent_id,
         session_id=fraud_session_id,
@@ -150,7 +151,8 @@ async def test_full_mcp_loan_lifecycle(mcp_setup):
         model_version="fraud-v1.5",
         context_source="fresh_start",
     )
-    result = await mcp.call_tool(
+        assert fraud_start["success"], f"start_agent_session (fraud) failed: {fraud_start}"
+        result = await mcp.call_tool(
         "record_fraud_screening",
         application_id=application_id,
         agent_id=fraud_agent_id,
@@ -162,25 +164,48 @@ async def test_full_mcp_loan_lifecycle(mcp_setup):
         screening_model_version="fraud-v1.5",
         input_data_hash="sha256:fraud_hash_001",
     )
-    assert result["success"], f"record_fraud_screening failed: {result}"
+        assert result["success"], f"record_fraud_screening failed: {result}"
 
-    # ── Step 5: Record compliance check ────────────────────────────────────
-    result = await mcp.call_tool(
+        # ── Step 5: Record compliance check ────────────────────────────────────
+        compliance_start = await mcp.call_tool(
+        "start_agent_session",
+        agent_id="compliance-agent-01",
+        session_id="comp-sess-001",
+        application_id=application_id,
+        model_version="comp-v1.0",
+        context_source="fresh_start",
+    )
+        assert compliance_start["success"], f"start_agent_session (compliance) failed: {compliance_start}"
+        result = await mcp.call_tool(
         "record_compliance_check",
         application_id=application_id,
-        session_id=session_id,
-        rule_id="AML_001",
-        rule_name="Anti-Money Laundering Check",
+        session_id="compliance-agent-01:comp-sess-001",
+        rule_id="AML_CHECK",
+        rule_name="AML_CHECK",
         rule_version="v2.1",
         passed=True,
         evidence_hash="sha256:aml_evidence_hash",
         regulation_set_version="FINCEN-2026",
     )
-    assert result["success"], f"record_compliance_check failed: {result}"
-    assert result["compliance_status"] == "PASSED"
+        assert result["success"], f"record_compliance_check failed: {result}"
+        assert result["compliance_status"] == "PASSED"
+        # Add remaining mandatory rules so approval precondition is satisfied.
+        for rule_id in ("KYC_CHECK", "SANCTIONS_CHECK"):
+            passed = await mcp.call_tool(
+            "record_compliance_check",
+            application_id=application_id,
+            session_id="compliance-agent-01:comp-sess-001",
+            rule_id=rule_id,
+            rule_name=rule_id,
+            rule_version="v2.1",
+            passed=True,
+            evidence_hash=f"sha256:{rule_id.lower()}",
+            regulation_set_version="FINCEN-2026",
+        )
+            assert passed["success"], f"{rule_id} compliance check failed: {passed}"
 
-    # ── Step 6: Generate decision ───────────────────────────────────────────
-    result = await mcp.call_tool(
+        # ── Step 6: Generate decision ───────────────────────────────────────────
+        result = await mcp.call_tool(
         "generate_decision",
         application_id=application_id,
         orchestrator_agent_id=agent_id,
@@ -188,15 +213,15 @@ async def test_full_mcp_loan_lifecycle(mcp_setup):
         confidence_score=0.82,
         contributing_agent_sessions=[session_id, fraud_session_id],
         decision_basis_summary="Strong financials, low fraud risk, AML compliant.",
-        model_versions={"credit": "credit-v2.3", "fraud": "fraud-v1.5"},
+        model_versions={session_id: "credit-v2.3", fraud_session_id: "fraud-v1.5"},
         approved_amount_usd=750000.0,
     )
-    assert result["success"], f"generate_decision failed: {result}"
-    assert result["recommendation"] == "APPROVE"
-    assert not result["confidence_floor_applied"]  # 0.82 >= 0.6
+        assert result["success"], f"generate_decision failed: {result}"
+        assert result["recommendation"] == "APPROVE"
+        assert not result["confidence_floor_applied"]  # 0.82 >= 0.6
 
-    # ── Step 7: Record human review ─────────────────────────────────────────
-    result = await mcp.call_tool(
+        # ── Step 7: Record human review ─────────────────────────────────────────
+        result = await mcp.call_tool(
         "record_human_review",
         application_id=application_id,
         reviewer_id="loan-officer-jane",
@@ -204,46 +229,48 @@ async def test_full_mcp_loan_lifecycle(mcp_setup):
         override=False,
         original_recommendation="APPROVE",
     )
-    assert result["success"], f"record_human_review failed: {result}"
-    assert result["final_decision"] == "APPROVE"
-    assert result["application_state"] == "APPROVED"
+        assert result["success"], f"record_human_review failed: {result}"
+        assert result["final_decision"] == "APPROVE"
+        assert result["application_state"] == "APPROVED"
 
-    # ── Process events through projections ─────────────────────────────────
-    await daemon.process_once()
+        # Wait for background daemon to project read models.
+        await asyncio.sleep(0.1)
 
-    # ── Step 8: Query compliance view ──────────────────────────────────────
-    compliance = await mcp.read_resource(
+        # ── Step 8: Query compliance view ──────────────────────────────────────
+        compliance = await mcp.read_resource(
         "ledger://applications/{application_id}/compliance",
         application_id=application_id,
     )
-    # ComplianceAuditView should have the AML rule
-    assert "error" not in compliance or compliance.get("rules_passed") is not None
-    if "rules_passed" in compliance:
-        assert "AML_001" in compliance["rules_passed"]
+        assert "error" not in compliance, compliance
+        expected_compliance_events = {"AML_CHECK", "KYC_CHECK", "SANCTIONS_CHECK"}
+        assert expected_compliance_events.issubset(set(compliance.get("rules_passed", [])))
 
-    # ── Step 9: Query full audit trail ─────────────────────────────────────
-    audit_trail = await mcp.read_resource(
+        # ── Step 9: Query full audit trail ─────────────────────────────────────
+        audit_trail = await mcp.read_resource(
         "ledger://applications/{application_id}/audit-trail",
         application_id=application_id,
     )
-    assert audit_trail["application_id"] == application_id
-    assert audit_trail["total_events"] >= 3  # at least submit, credit, decision
+        assert audit_trail["application_id"] == application_id
+        assert audit_trail["total_events"] >= 3  # at least submit, credit, decision
 
-    event_types = [e["event_type"] for e in audit_trail["events"]]
-    assert "ApplicationSubmitted" in event_types
-    assert "CreditAnalysisCompleted" in event_types
-    assert "HumanReviewCompleted" in event_types
-    assert "ApplicationApproved" in event_types
+        event_types = [e["event_type"] for e in audit_trail["events"]]
+        assert "ApplicationSubmitted" in event_types
+        assert "CreditAnalysisCompleted" in event_types
+        assert "HumanReviewCompleted" in event_types
+        assert "ApplicationApproved" in event_types
+        assert "ComplianceRulePassed" in event_types
 
-    # ── Step 10: Query application summary ─────────────────────────────────
-    summary = await mcp.read_resource(
+        # ── Step 10: Query application summary ─────────────────────────────────
+        summary = await mcp.read_resource(
         "ledger://applications/{application_id}",
         application_id=application_id,
     )
-    assert "error" not in summary or "application_id" in summary
-    # After daemon processing, state should reflect approved
-    if "state" in summary:
-        assert summary["state"] == "APPROVED"
+        assert "error" not in summary or "application_id" in summary
+        # After daemon processing, state should reflect approved
+        if "state" in summary:
+            assert summary["state"] == "APPROVED"
+    finally:
+        daemon_task.cancel()
 
 
 # ─── Confidence Floor Enforcement ──────────────────────────────────────────

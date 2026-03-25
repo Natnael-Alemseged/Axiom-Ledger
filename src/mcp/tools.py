@@ -29,11 +29,18 @@ def _now() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
-def _error(error_type: str, message: str, suggested_action: str = "", **kwargs) -> dict:
+def _error(
+    error_type: str,
+    message: str,
+    suggested_action: str = "",
+    context: dict[str, Any] | None = None,
+    **kwargs,
+) -> dict:
     return {
         "success": False,
         "error_type": error_type,
         "message": message,
+        "context": context or {},
         "suggested_action": suggested_action,
         **kwargs,
     }
@@ -52,6 +59,31 @@ def register_tools(mcp: FastMCP, store_factory) -> None:
     Register all 8 command-side tools onto the MCP server.
     store_factory() returns a connected EventStore instance.
     """
+
+    async def _resolve_agent_session(session_ref: str) -> tuple[str, str] | None:
+        """
+        Resolve a session reference to (agent_id, session_id).
+        Accepts:
+        - "agent_id:session_id"
+        - "session_id" (best-effort lookup via in-memory store keys)
+        """
+        if ":" in session_ref:
+            agent_id, session_id = session_ref.split(":", 1)
+            return agent_id, session_id
+
+        store = store_factory()
+        stream_suffix = f"-{session_ref}"
+
+        # In-memory lookup for tests and local execution.
+        stream_map = getattr(store, "_streams", {})
+        for stream_id in stream_map.keys():
+            if stream_id.startswith("agent-") and stream_id.endswith(stream_suffix):
+                # stream pattern: agent-{agent_id}-{session_id}
+                remainder = stream_id[len("agent-") :]
+                agent_id = remainder[: -len(stream_suffix)]
+                if agent_id:
+                    return agent_id, session_ref
+        return None
 
     # ------------------------------------------------------------------
     # TOOL 1: submit_application
@@ -352,10 +384,24 @@ def register_tools(mcp: FastMCP, store_factory) -> None:
         regulation_set_version: str = "v1.0",
     ) -> dict:
         store = store_factory()
+        from src.aggregates.agent_session import AgentSessionAggregate
+        from src.models.events import DomainError
         from src.models.events import OptimisticConcurrencyError
 
         stream_id = f"compliance-{application_id}"
         try:
+            resolved = await _resolve_agent_session(session_id)
+            if resolved is None:
+                return _error(
+                    "PreconditionFailed",
+                    f"Agent session '{session_id}' not found",
+                    "Call start_agent_session first and pass a valid session reference",
+                    context={"session_id": session_id, "application_id": application_id},
+                )
+            agent_id, resolved_session_id = resolved
+            session = await AgentSessionAggregate.load(store, agent_id, resolved_session_id)
+            session.assert_context_loaded()
+
             version = await store.stream_version(stream_id)
             if passed:
                 event = {
@@ -363,7 +409,8 @@ def register_tools(mcp: FastMCP, store_factory) -> None:
                     "event_version": 1,
                     "payload": {
                         "application_id": application_id,
-                        "session_id": session_id,
+                        "session_id": resolved_session_id,
+                        "agent_id": agent_id,
                         "rule_id": rule_id,
                         "rule_name": rule_name,
                         "rule_version": rule_version,
@@ -378,7 +425,8 @@ def register_tools(mcp: FastMCP, store_factory) -> None:
                     "event_version": 1,
                     "payload": {
                         "application_id": application_id,
-                        "session_id": session_id,
+                        "session_id": resolved_session_id,
+                        "agent_id": agent_id,
                         "rule_id": rule_id,
                         "rule_name": rule_name,
                         "rule_version": rule_version,
@@ -399,11 +447,19 @@ def register_tools(mcp: FastMCP, store_factory) -> None:
                 compliance_status="PASSED" if passed else "FAILED",
                 rule_id=rule_id,
             )
+        except DomainError as e:
+            return _error(
+                "PreconditionFailed",
+                str(e),
+                "Ensure start_agent_session was called for this session before compliance events",
+                context={"session_id": session_id, "application_id": application_id},
+            )
         except OptimisticConcurrencyError as e:
             return _error(
                 "OptimisticConcurrencyError", str(e),
                 "reload_stream_and_retry",
                 stream_id=stream_id,
+                context={"stream_id": stream_id, "expected_version": e.expected, "actual_version": e.actual},
             )
         except Exception as e:
             return _error("InternalError", str(e), "Check server logs")
@@ -431,18 +487,46 @@ def register_tools(mcp: FastMCP, store_factory) -> None:
         approved_amount_usd: float | None = None,
     ) -> dict:
         store = store_factory()
+        from src.aggregates.compliance_record import ComplianceRecordAggregate
+        from src.aggregates.agent_session import AgentSessionAggregate
         from src.aggregates.loan_application import LoanApplicationAggregate
         from src.models.events import DomainError, OptimisticConcurrencyError
 
         try:
             # Load aggregate — enforces load→validate→determine→append pattern
             app = await LoanApplicationAggregate.load(store, application_id)
+            compliance = await ComplianceRecordAggregate.load(store, application_id)
             app.assert_can_generate_decision()
+            app.assert_causal_chain(contributing_agent_sessions)
 
             # Confidence floor: enforced inside aggregate logic (not API layer)
             recommendation, floor_applied = app.enforce_confidence_floor(
                 recommendation, confidence_score
             )
+            if recommendation == "APPROVE":
+                compliance.assert_approval_preconditions()
+            app.assert_approval_dependencies(
+                recommendation=recommendation,
+                compliance_ready=compliance.mandatory_checks_passed and not compliance.has_hard_block,
+            )
+
+            # Enforce causal chain + model version consistency for all contributors.
+            normalized_versions = model_versions or {}
+            for session_ref in contributing_agent_sessions:
+                resolved = await _resolve_agent_session(str(session_ref))
+                if resolved is None:
+                    raise DomainError(
+                        f"Unknown contributing agent session '{session_ref}'. "
+                        "Use 'agent_id:session_id' format or provide an existing session id."
+                    )
+                agent_id, resolved_session_id = resolved
+                session = await AgentSessionAggregate.load(store, agent_id, resolved_session_id)
+                session.assert_context_loaded()
+                declared_version = normalized_versions.get(agent_id)
+                if declared_version is None:
+                    declared_version = normalized_versions.get(resolved_session_id)
+                if declared_version is not None:
+                    session.assert_model_version_current(declared_version)
 
             event = {
                 "event_type": "DecisionGenerated",
@@ -454,7 +538,7 @@ def register_tools(mcp: FastMCP, store_factory) -> None:
                     "confidence_score": confidence_score,
                     "contributing_agent_sessions": contributing_agent_sessions,
                     "decision_basis_summary": decision_basis_summary,
-                    "model_versions": model_versions or {},
+                    "model_versions": normalized_versions,
                     "approved_amount_usd": approved_amount_usd,
                     "generated_at": _now(),
                 },
@@ -473,7 +557,11 @@ def register_tools(mcp: FastMCP, store_factory) -> None:
         except DomainError as e:
             return _error(
                 "PreconditionFailed", str(e),
-                "Ensure credit analysis is complete before generating decision",
+                (
+                    "Ensure lifecycle preconditions are met: credit complete, "
+                    "compliance passed for approvals, and contributing sessions are valid"
+                ),
+                context={"application_id": application_id},
             )
         except OptimisticConcurrencyError as e:
             return _error(
@@ -482,6 +570,7 @@ def register_tools(mcp: FastMCP, store_factory) -> None:
                 stream_id=f"loan-{application_id}",
                 expected_version=e.expected,
                 actual_version=e.actual,
+                context={"stream_id": f"loan-{application_id}", "expected_version": e.expected, "actual_version": e.actual},
             )
         except Exception as e:
             return _error("InternalError", str(e), "Check server logs")
