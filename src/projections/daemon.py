@@ -9,14 +9,14 @@ logger = logging.getLogger(__name__)
 class ProjectionDaemon:
     """Async daemon that polls the event store and routes events to projections."""
 
-    def __init__(self, store, projections: list):
+    def __init__(self, store, projections: list, max_retries: int = 3):
         self._store = store
         self._projections = {p.name: p for p in projections}
         self._running = False
         self._lag_ms: dict[str, float] = {p.name: 0.0 for p in projections}
         self._checkpoints: dict[str, int] = {}
         self._error_counts: dict[str, int] = {}
-        self._max_retries: int = 3
+        self._max_retries: int = max_retries
         # Tracks the wall-clock time (ms) of the most recently processed event per projection
         self._last_event_time_ms: dict[str, float] = {}
 
