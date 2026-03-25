@@ -11,10 +11,10 @@ Any system where upcasting touches stored events has broken the core guarantee o
 """
 from __future__ import annotations
 
-import asyncio
 import pytest
+from datetime import datetime, timezone
 
-from src.event_store import InMemoryEventStore, UpcasterRegistry
+from src.event_store import InMemoryEventStore
 from src.upcasting.registry import UpcasterRegistry as StandaloneRegistry
 from src.upcasting.upcasters import registry as default_registry
 
@@ -132,6 +132,50 @@ async def test_decision_generated_upcasting_immutability():
     assert "model_versions" not in raw["payload"], (
         "model_versions was written into the raw stored payload — immutability violated."
     )
+
+
+def test_credit_upcast_inference_uses_recorded_at():
+    """model_version and regulatory_basis use event.recorded_at when payload omits them."""
+    event = {
+        "event_type": "CreditAnalysisCompleted",
+        "event_version": 1,
+        "recorded_at": datetime(2020, 3, 1, 12, 0, 0, tzinfo=timezone.utc),
+        "payload": {
+            "application_id": "app-inf",
+            "agent_id": "ag-1",
+            "session_id": "s-1",
+            "risk_tier": "LOW",
+            "recommended_limit_usd": 100000,
+            "analysis_duration_ms": 100,
+            "input_data_hash": "x",
+        },
+    }
+    out = default_registry.upcast(dict(event))
+    assert out["event_version"] == 2
+    assert "credit-legacy-y2020" in out["payload"]["model_version"]
+    assert out["payload"]["regulatory_basis"]
+    assert out["payload"]["regulatory_basis"][0].get("package") == "FIN_BASE"
+
+
+def test_decision_upcast_reconstructs_model_versions_from_sessions():
+    event = {
+        "event_type": "DecisionGenerated",
+        "event_version": 1,
+        "recorded_at": datetime(2025, 7, 1, tzinfo=timezone.utc),
+        "payload": {
+            "application_id": "app-d",
+            "orchestrator_agent_id": "orch",
+            "recommendation": "APPROVE",
+            "confidence_score": 0.9,
+            "contributing_agent_sessions": ["sess-001", "sess-002"],
+            "decision_basis_summary": "ok",
+        },
+    }
+    out = default_registry.upcast(dict(event))
+    assert out["event_version"] == 2
+    mv = out["payload"]["model_versions"]
+    assert set(mv.keys()) == {"sess-001", "sess-002"}
+    assert all(v.startswith("inferred-from-session@y2025:") for v in mv.values())
 
 
 # ─── Test: UpcasterRegistry.upcast() returns new dict ─────────────────────
