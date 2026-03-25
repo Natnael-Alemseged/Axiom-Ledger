@@ -118,13 +118,20 @@ async def test_agent_context_reconstruction_after_crash(store):
     assert context.application_id == "app-crash-001"
     assert context.model_version == "credit-v2.3"
     assert context.events_replayed == 5
-    assert context.last_event_position == 4  # 0-indexed, 5 events
+    assert context.last_event_position == 4  # 0-indexed, 5 events → position 4
     assert context.session_health_status == SessionHealthStatus.HEALTHY
     assert len(context.context_text) > 0
     assert context.context_text != ""
 
     # Context must contain enough information to continue
     assert "app-crash-001" in context.context_text or context.application_id == "app-crash-001"
+
+    # Pending work: AgentToolCalled (get_historical_profile) has no corresponding
+    # AgentToolCompleted, so it should appear as pending work for the resumed agent
+    assert len(context.pending_work) > 0, (
+        "Reconstructed context should have pending_work items — "
+        "the AgentToolCalled event has no corresponding completion"
+    )
 
 
 @pytest.mark.asyncio

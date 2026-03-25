@@ -86,6 +86,9 @@ async def reconstruct_agent_context(
     pending_work: list[str] = []
     health_status = SessionHealthStatus.HEALTHY
 
+    # Track tool calls awaiting results (tool called but no completion seen yet)
+    _pending_tool_calls: list[str] = []
+
     # Extract key state
     for event in events:
         et = event["event_type"]
@@ -99,6 +102,17 @@ async def reconstruct_agent_context(
         elif et in _PARTIAL_EVENT_TYPES:
             health_status = SessionHealthStatus.NEEDS_RECONCILIATION
             pending_work.append(f"Resolve {et}: {p.get('error_type', 'unknown error')}")
+        elif et == "AgentToolCalled":
+            tool_name = p.get("tool_name", "unknown_tool")
+            _pending_tool_calls.append(tool_name)
+        elif et == "AgentToolCompleted":
+            tool_name = p.get("tool_name", "")
+            if tool_name in _pending_tool_calls:
+                _pending_tool_calls.remove(tool_name)
+
+    # Tool calls with no corresponding completion = pending work items
+    for tool_name in _pending_tool_calls:
+        pending_work.append(f"Awaiting result for tool call: {tool_name}")
 
     # Check for partial decisions (started but no completion)
     event_types_seen = {e["event_type"] for e in events}
