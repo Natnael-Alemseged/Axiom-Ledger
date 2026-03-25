@@ -8,31 +8,7 @@ from typing import Any, AsyncGenerator, Callable
 from uuid import UUID, uuid4
 
 from src.models.events import OptimisticConcurrencyError, StreamMetadata
-
-
-class UpcasterRegistry:
-    def __init__(self):
-        self._upcasters: dict[str, dict[int, Callable[[dict], dict]]] = {}
-
-    def upcaster(self, event_type: str, from_version: int, to_version: int):
-        if to_version != from_version + 1:
-            raise ValueError("Only one-step upcasters are supported per registration")
-
-        def decorator(fn: Callable[[dict], dict]):
-            self._upcasters.setdefault(event_type, {})[from_version] = fn
-            return fn
-
-        return decorator
-
-    def upcast(self, event: dict) -> dict:
-        version = int(event.get("event_version", 1))
-        event_type = event["event_type"]
-        chain = self._upcasters.get(event_type, {})
-        while version in chain:
-            event["payload"] = chain[version](dict(event["payload"]))
-            version += 1
-            event["event_version"] = version
-        return event
+from src.upcasting.registry import UpcasterRegistry
 
 
 class EventStore:
