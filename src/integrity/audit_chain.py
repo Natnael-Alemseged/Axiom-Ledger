@@ -37,8 +37,8 @@ def _hash_event(event: dict) -> str:
 
 
 def _compute_chain_hash(previous_hash: str | None, event_hashes: list[str]) -> str:
-    """Compute integrity hash: SHA-256(previous_hash | event_hash_1 | ... | event_hash_n)."""
-    data = (previous_hash or "GENESIS") + "|".join(event_hashes)
+    """Compute integrity hash: SHA-256(previous_hash + concat(event_hashes))."""
+    data = (previous_hash or "GENESIS") + "".join(event_hashes)
     return hashlib.sha256(data.encode()).hexdigest()
 
 

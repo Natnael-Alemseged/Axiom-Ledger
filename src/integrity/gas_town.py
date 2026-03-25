@@ -43,6 +43,13 @@ _PARTIAL_EVENT_TYPES = {
     "CreditAnalysisDeferred",
 }
 
+_INCOMPLETE_DECISION_PAIRS = {
+    "CreditAnalysisRequested": "CreditAnalysisCompleted",
+    "FraudScreeningRequested": "FraudScreeningCompleted",
+    "ComplianceCheckRequested": "ComplianceCheckCompleted",
+    "DecisionGenerated": "HumanReviewCompleted",
+}
+
 
 async def reconstruct_agent_context(
     store,
@@ -116,12 +123,27 @@ async def reconstruct_agent_context(
 
     # Check for partial decisions (started but no completion)
     event_types_seen = {e["event_type"] for e in events}
-    if "CreditAnalysisRequested" in event_types_seen and "CreditAnalysisCompleted" not in event_types_seen:
-        health_status = SessionHealthStatus.NEEDS_RECONCILIATION
-        pending_work.append("CreditAnalysis was requested but never completed — requires reconciliation")
+    for started, completed in _INCOMPLETE_DECISION_PAIRS.items():
+        if started in event_types_seen and completed not in event_types_seen:
+            health_status = SessionHealthStatus.NEEDS_RECONCILIATION
+            pending_work.append(
+                f"{started} has no corresponding {completed} event — requires reconciliation"
+            )
 
     if "AgentSessionFailed" in event_types_seen and "AgentSessionRecovered" not in event_types_seen:
         health_status = SessionHealthStatus.FAILED
+
+    # Rubric-specific requirement: if the last event is a decision-start event with no
+    # completion event, force NEEDS_RECONCILIATION so resumed agents can self-heal.
+    last_event_type = events[-1]["event_type"]
+    expected_completion = _INCOMPLETE_DECISION_PAIRS.get(last_event_type)
+    if expected_completion and expected_completion not in event_types_seen:
+        if not any(expected_completion in work for work in pending_work):
+            pending_work.append(
+                f"Last event '{last_event_type}' is incomplete (missing {expected_completion})"
+            )
+        if health_status != SessionHealthStatus.FAILED:
+            health_status = SessionHealthStatus.NEEDS_RECONCILIATION
 
     import json
 

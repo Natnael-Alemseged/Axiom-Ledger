@@ -247,3 +247,45 @@ async def test_context_respects_token_budget(store):
     context = await reconstruct_agent_context(store, agent_id, session_id, token_budget=token_budget)
     max_chars = token_budget * 4
     assert len(context.context_text) <= max_chars + 100  # small tolerance for truncation marker
+
+
+@pytest.mark.asyncio
+async def test_last_decision_without_completion_flags_needs_reconciliation(store):
+    await store.connect()
+    agent_id = "credit-agent-04"
+    session_id = "sess-partial-001"
+    stream_id = f"agent-{agent_id}-{session_id}"
+
+    await store.append(
+        stream_id=stream_id,
+        events=[
+            {
+                "event_type": "AgentContextLoaded",
+                "event_version": 1,
+                "payload": {
+                    "agent_id": agent_id,
+                    "session_id": session_id,
+                    "application_id": "app-partial-001",
+                    "model_version": "v2.0",
+                    "context_source": "replay",
+                    "event_replay_from_position": 0,
+                    "context_token_count": 400,
+                },
+            },
+            {
+                "event_type": "DecisionGenerated",
+                "event_version": 1,
+                "payload": {
+                    "application_id": "app-partial-001",
+                    "recommendation": "APPROVE",
+                    "confidence_score": 0.83,
+                },
+            },
+        ],
+        expected_version=-1,
+    )
+
+    context = await reconstruct_agent_context(store, agent_id, session_id)
+    assert context.last_event_position == 1
+    assert context.pending_work, "Expected pending_work for incomplete decision"
+    assert context.session_health_status == SessionHealthStatus.NEEDS_RECONCILIATION
